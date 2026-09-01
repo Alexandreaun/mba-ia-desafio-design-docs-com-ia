@@ -28,9 +28,6 @@ Quando múltiplos módulos são especificados, inicia agentes em paralelo para u
 /adr-identify
 # Solicita quais módulos analisar (usa docs/adrs por padrão)
 
-/adr-identify AUTH
-# Analisa apenas o módulo AUTH
-
 /adr-identify AUTH --transcript-file=docs/transcricao.md
 # Analisa o módulo AUTH cruzando as evidências de código com as decisões extraídas da transcrição
 
