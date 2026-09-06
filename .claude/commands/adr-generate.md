@@ -8,11 +8,11 @@ Inicia o agente `adr-generator` para gerar ADRs formais a partir de ADRs potenci
 Quando vários módulos ou arquivos são especificados, inicia os agentes em paralelo para uma geração mais rápida.
 
 **O que faz**:
-- Gera ADRs formais utilizando o marcador XXX para a numeração
+- Gera ADRs formais salvando todos os arquivos diretamente no diretório raiz de saída (padrão: `docs/adrs/`), sem criar subpastas por módulo.
+- Aplica uma numeração sequencial automática no momento da orquestração.
+- Adota obrigatoriamente a nomenclatura no formato `ADR-[NUMERO]-[titulo-curto]-[nome-do-modulo].md` (exemplo: `ADR-001-eventos-webhook-orders.md`).
 - Executa múltiplos alvos em paralelo quando dois ou mais alvos são especificados
 - Detecta relações com ADRs existentes
-- Organiza por módulo: `generated/{MODULE}/` ou `generated/{MODULE}/needs-input/`
-- Requer renumeração manual após a geração
 
 **Uso**:
 ```
@@ -22,17 +22,17 @@ Quando vários módulos ou arquivos são especificados, inicia os agentes em par
 **Exemplos**:
 ```
 /adr-generate --all
-# Gere TODOS os potenciais ADRs em docs/adrs/generated/{MODULE}/
-# Excluindo a propriedade "consider" if --include-consider is not specified
+# Gere TODOS os potenciais ADRs em docs/adrs/ 
+#Excluindo a prioridade "consider" se --include-consider não for especificado
 
 /adr-generate CONFIG
-# Gere em docs/adrs/generated/CONFIG/
+# Gere ADRs formais sequenciais no diretório docs/adrs/
 
 /adr-generate CONFIG USERS ORDERS
-# Gere múltiplos módulos em paralelo
+# Gere múltiplos módulos em paralelo, unificando todos na mesma pasta raiz com numeração sequencial
 
 /adr-generate --include-consider CONFIG
-# Inclua ambos must-document AND consider priorities
+# Inclua ambos must-document E consider
 
 /adr-generate --language=pt-BR --include-consider CONFIG USERS
 # Gerar em português com todas as prioridades
@@ -41,7 +41,7 @@ Quando vários módulos ou arquivos são especificados, inicia os agentes em par
 # Gerar com contexto estratégico
 
 /adr-generate --output-dir=output/adrs CONFIG
-# Gerar para o diretório de saída personalizado: output/adrs/generated/CONFIG/
+# Gerar sequencialmente para o diretório de saída personalizado: output/adrs/
 ```
 
 ---
