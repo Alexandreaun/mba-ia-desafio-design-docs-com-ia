@@ -20,7 +20,7 @@ Transformar ADRs potenciais (da Fase 2) em documentos ADR formais com:
   - **Decisão**: A escolha arquitetural final adotada e sua justificativa unificada.
   - **Alternativas Consideradas**: É OBRIGATÓRIO listar pelo menos 1 alternativa real. Priorize alternativas explicitamente discutidas pela equipe na transcrição. Caso não haja menção na transcrição, descreva uma alternativa tecnicamente plausível para o cenário, explicando o motivo técnico ou de negócio.
   - **Consequências**: É OBRIGATÓRIO listar as consequências positivas E negativas decorrentes da decisão. Você deve expor de forma explícita o trade-off assumido pela equipe ao adotar esta arquitetura.
-  - **Referências**: ALTAMENTE PRIORITÁRIO. Você DEVE fazer o máximo esforço para incluir esta seção, referenciando explicitamente arquivos, módulos ou padrões do código existente, ou fazendo apontamentos diretos a trechos da transcrição da reunião de refinamento (como, por exemplo, os debates decisivos sobre Webhooks). A omissão desta seção só é permitida em caso de ausência total e absoluta de evidências rastreáveis.
+  - **Referências**: ALTAMENTE PRIORITÁRIO. Você DEVE fazer o máximo esforço para incluir esta seção, referenciando explicitamente arquivos, módulos ou padrões do código existente, ou fazendo apontamentos diretos a trechos da transcrição da reunião de refinamento (como, por exemplo, os debates decisivos). A omissão desta seção só é permitida em caso de ausência total e absoluta de evidências rastreáveis.
 
 ## PRINCÍPIOS CRÍTICOS
 
@@ -45,9 +45,8 @@ Suporte a qualquer idioma via parâmetro `--language` (ex.: pt-BR, es, fr, de).
 
 **Limites de Extensão**:
 - Contexto: 2 a 3 parágrafos (máximo de 250 a 300 palavras)
-- Fatores decisivos: 4 a 6 tópicos, com uma frase cada
-- Opções consideradas: 2 a 3 opções (NUNCA mais de 3)
-- Resultado da decisão: 1 a 2 parágrafos
+- Decisão: 1 a 2 parágrafos
+- Alternativas Consideradas: no mínimo 1 (NUNCA mais de 3)
 - Prós/Contras por opção: 3 a 4 tópicos cada
 - Consequências: 2 a 3 parágrafos
 - Referências: apenas 3 a 5 arquivos
@@ -121,7 +120,7 @@ Adicionar ao cabeçalho da ADR-012: **Supersedes:** ADR-005
 **Cabeçalho permitido**:
 ```
 # ADR-XXX: Title
-**Status:**  Aceita|Proposta|Descontinuada|Substituída
+**Status:**  Aceita|Proposta|Rejeitada|Substituída
 **Date:** YYYY-MM-DD (or DD-MM-AAAA for non-English)
 **Related ADRs:** ADR-XXX, ADR-XXX (opcional)
 ```
@@ -129,7 +128,7 @@ Adicionar ao cabeçalho da ADR-012: **Supersedes:** ADR-005
 **Apenas 6 seções**:
 1. Status
 2. Contexto
-3. Resultado da decisão
+3. Decisão
 4. Alternativas Consideradas
 5. Consequências
 6. Referências
@@ -153,10 +152,10 @@ Estas regras evitam ADRs verbosas e focadas na implementação. Foque na DECISÃ
 
 **Conteúdo proibido**:
 - Trechos de código ou hierarquias de classes detalhadas
-- Mais de 10 referências a arquivos (máx. 5)
+- Mais de 5 referências a arquivos (máx. 5)
 - Detalhes de implementação (cron jobs, credenciais de API, caminhos de configuração)
 - Sugestões futuras ("considere X", "avalie Y", "se o volume exceder Z")
-- Mais de 5 marcadores [NEEDS INPUT] (máx. 4)
+- Mais de 4 marcadores [NEEDS INPUT] (máx. 4)
 
 **Exemplo de ADR RUIM**:
 - 600 linhas (meta: 100-250)
@@ -211,7 +210,7 @@ Estas regras evitam ADRs verbosas e focadas na implementação. Foque na DECISÃ
 
 **Carregamento de Contexto**: Se `--context-dir` for fornecido, ler todos os arquivos `.md` e `.txt` e construir uma base de conhecimento pesquisável
 
-**Numeração de ADRs**: Utilizar o marcador `XXX` para a ADR gerada
+**Numeração de ADRs**: Utilizar o marcador `XXX` como placeholder provisório durante a geração desta ADR individual (múltiplas instâncias deste agente podem estar rodando em paralelo, cada uma processando um arquivo diferente, sem visibilidade das demais). Após a geração de TODAS as ADRs do lote estar concluída, é necessária uma etapa final de renumeração sequencial: listar todos os arquivos `ADR-XXX-*.md` recém-gerados em `{OUTPUT_DIR}` e `{OUTPUT_DIR}/needs-input/`, ordená-los de forma determinística (pela Data da Decisão extraída em 2.3 e, em empate, pela ordem de processamento dos arquivos de ADR potencial), atribuir os números sequenciais finais dando continuidade às ADRs já existentes no projeto, renomear os arquivos de `XXX` para o número definitivo e atualizar todas as referências cruzadas afetadas (`Related ADRs`, `Supersedes`, `Superseded by`) para refletir a numeração final.
 
 ### 2. PROCESSAR O ARQUIVO DE POTENCIAL ADR
 
@@ -261,7 +260,7 @@ Estas regras evitam ADRs verbosas e focadas na implementação. Foque na DECISÃ
 - Se o contexto estratégico estiver ausente e as perguntas envolverem aspectos de negócio, custos ou regulamentação → Nível 2
 - Se a análise de *trade-offs* estiver incompleta (faltando as desvantagens/pontos negativos) → Nível 2
 
-**Nível 1** (generated/): Todo o restante – decisões técnicas com evidências completas no código e na transcrição
+**Nível 1** (OUTPUT_DIR/): Todo o restante – decisões técnicas com evidências completas no código e na transcrição
 
 **2.6 Gerar ADR Formal**
 
@@ -278,10 +277,11 @@ Estas regras evitam ADRs verbosas e focadas na implementação. Foque na DECISÃ
 - Adicione o contexto estratégico complementar, caso tenha sido fornecido nos documentos externos.
 - Adicione o marcador `[NEEDS INPUT: ...]` especificando a lacuna exata caso a motivação de negócio da reunião ou a limitação técnica subjacente não estejam claras nas fontes analisadas.
 
-**Fatores Decisivos**:
-- Extraia informações de Impacto, *Trade-offs* e Complexidade da seção "Por que isso pode justificar uma ADR"
-- Adicione fatores estratégicos, se o contexto tiver sido fornecido
-- Máximo de 4 a 6 itens (bullet points), com uma frase cada
+**Seção de Decisão**:
+- Declare de forma direta a escolha arquitetural final adotada e construa sua justificativa unificada, cruzando Impacto, *Trade-offs* e Complexidade extraídos da seção "Por que isso pode justificar uma ADR" com os fatores estratégicos do `--context-dir`, se fornecido.
+- Explique o "porquê" da escolha, amarrando a motivação de negócio (transcrição) à necessidade técnica (código) — não apenas descreva "o quê" foi decidido.
+- Adicione o marcador `[NEEDS INPUT: ...]` caso a justificativa completa da escolha não esteja clara nas fontes analisadas.
+- Limite-se a 1-2 parágrafos.
 
 **Alternativas Consideradas** (MÁX. 3):
 - É OBRIGATÓRIO listar pelo menos 1 alternativa real avaliada e rejeitada.
@@ -289,6 +289,7 @@ Estas regras evitam ADRs verbosas e focadas na implementação. Foque na DECISÃ
 - **Prioridade 2 (Código)**: Utilize as opções mapeadas na seção "Alternativa Não Escolhida" provenientes da análise da ADR potencial.
 - **Prioridade 3 (Inferência Plausível)**: Caso não haja menção de alternativas na transcrição nem evidências no código, você DEVE descrever uma alternativa tecnicamente plausível para o cenário, explicando o provável motivo técnico ou de negócio para sua rejeição. Neste cenário de inferência, adicione o marcador `[NEEDS INPUT: Validar se esta alternativa inferida foi de fato considerada pela equipe]`.
 - **Filtro de Excesso**: Se 4 ou mais opções forem identificadas nas fontes, selecione e consolide APENAS as 3 arquiteturalmente mais significativas para o negócio.
+- **Estrutura por Alternativa (Prós/Contras)**: Para cada alternativa selecionada, estruture explicitamente Prós e Contras separados, com 3 a 4 tópicos cada (uma frase por tópico), cobrindo os trade-offs técnicos e/ou de negócio que embasaram a rejeição em favor da decisão adotada.
 
 **Consequências**:
 - É OBRIGATÓRIO listar as consequências positivas E as negativas decorrentes da decisão.
@@ -298,8 +299,8 @@ Estas regras evitam ADRs verbosas e focadas na implementação. Foque na DECISÃ
 
 **Referências** (máx. 3-5 arquivos):
 - A inclusão desta seção é OPCIONAL apenas no caso extremo em que não exista absolutamente nenhuma evidência rastreável para esta decisão específica. 
-- **REGRA GLOBAL CRÍTICA**: O conjunto de documentação gerado exige que exista pelo menos 1 ADR com referências explícitas. Portanto, você DEVE se esforçar ao máximo para vasculhar a base de código (ADR potencial) e a transcrição em busca de apontamentos antes de decidir omitir esta seção.
-- Quando encontrar evidências, você deve referenciar explicitamente arquivos, módulos ou padrões do código existente E/OU fazer apontamentos diretos a trechos relevantes da transcrição da reunião de refinamento (como, por exemplo, debates decisivos sobre Webhooks).
+- **REGRA GLOBAL CRÍTICA**: Pelo menos 1 ADR deve referenciar explicitamente arquivos, módulos ou padrões do código existente. Portanto, você DEVE se esforçar ao máximo para vasculhar a base de código (ADR potencial) e a transcrição em busca de apontamentos antes de decidir omitir esta seção.
+- Quando encontrar evidências, você deve referenciar explicitamente arquivos, módulos ou padrões do código existente E/OU fazer apontamentos diretos a trechos relevantes da transcrição da reunião de refinamento (como, por exemplo, debates decisivos).
 - **Prioridade de Seleção (quando aplicável)**: 
   1. Trechos ou tópicos cruciais da transcrição que embasaram a decisão de negócio.
   2. 1 a 2 modelos de dados/entidades fundamentais no código.
@@ -307,7 +308,7 @@ Estas regras evitam ADRs verbosas e focadas na implementação. Foque na DECISÃ
   4. 0 a 1 arquivo de configuração.
 - **Formato Esperado**: 
   - Para código: `caminho/para/arquivo.ext:linha`
-  - Para transcrição: Referência clara ao tópico debatido (ex: `transcricao.md - Debate de refinamento sobre resiliência de Webhooks`).
+  - Para transcrição: Referência clara ao tópico debatido (ex: `transcricao.md - Debate de refinamento sobre resiliência de nova funcionalidade`).
 - Selecione APENAS os apontamentos mais representativos. Se for estritamente necessário omitir a seção por falta total de evidências, não adicione marcadores de erro; apenas finalize a estrutura da ADR sem o bloco "Referências".
 
 **Marcadores de Lacunas** (máx. 4):
@@ -315,8 +316,8 @@ Estas regras evitam ADRs verbosas e focadas na implementação. Foque na DECISÃ
 - Se uma pergunta estratégica não for respondida pelo contexto: adicione um item específico [NEEDS INPUT: ...]
 - Exemplos:
 - "Quais requisitos de negócio?" → Seção de Contexto
-- "Quais foram os custos?" → Fatores Decisórios
-- "Por que X em vez de Y?" → Resultado da Decisão
+- "Quais foram os custos ou trade-offs assumidos?" → Consequências
+- "Por que X em vez de Y?" → Decisão
 
 **2.7 Detectar Relacionamentos** (se houver ADRs existentes)
 
@@ -359,9 +360,9 @@ Estas regras evitam ADRs verbosas e focadas na implementação. Foque na DECISÃ
 
 **CRÍTICO**: Antes de gravar, valide em relação a todas as regras:
 
-1. **Validação de Formato**: O cabeçalho contém APENAS Status, Data e ADRs Relacionadas (opcional). Exatamente 7 seções. NENHUMA seção extra.
+1. **Validação de Formato**: O cabeçalho contém APENAS Status, Data e ADRs Relacionadas (opcional). Exatamente 6 seções. NENHUMA seção extra.
 2. **Validação de Conteúdo**: Nenhum bloco de código. Nenhum nome de classe/método/função. Nenhum nome de tabela/coluna. Nenhum endpoint de API. Referências são APENAS caminhos de arquivo.
-3. **Validação de Extensão**: Contexto: máx. 3 parágrafos. Motivadores: máx. 6 itens. Opções: máx. 3. Prós/Contras: máx. 4 itens cada. Consequências: máx. 3 parágrafos. Referências: máx. 5 arquivos. Total: máx. 250 linhas.
+3. **Validação de Extensão**: Contexto: máx. 3 parágrafos. Decisão: máx. 2 parágrafos. Alternativas Consideradas: máx. 3 opções. Prós/Contras: máx. 4 itens cada. Consequências: máx. 3 parágrafos. Referências: máx. 5 arquivos. Total: máx. 250 linhas.
 4. **Validação de Lacunas**: Máx. 4 marcadores `[NEEDS INPUT]`. Cada marcador deve ser específico (não genérico). Indica claramente o que está faltando.
 5. **Validação de Idioma** (se `--language` for fornecido): Títulos de seção traduzidos. `[NEEDS INPUT]` traduzido. Status traduzido. Formato de data correto para o idioma. **Se a validação falhar**: Corrigir automaticamente antes da gravação (remover espaços em branco, consolidar, traduzir, remover elementos extras)
 
@@ -382,14 +383,14 @@ Estas regras evitam ADRs verbosas e focadas na implementação. Foque na DECISÃ
 ## CRITÉRIOS DE SUCESSO
 
 **Distribuição**:
-- 60-80% das ADRs em `generated/` (Nível 1)
+- 60-80% das ADRs em `{OUTPUT_DIR}` (Nível 1)
 - 20-40% das ADRs em `needs-input/` (Nível 2)
 
 **Conformidade de Formato**:
 - 100% de conformidade com o formato MADR
 - SEM campos de cabeçalho extras (Tomadores de Decisão, História Técnica, Evolução Temporal)
 - SEM seções extras (Validação, Mais Informações, Arquitetura Futura, Questões em Aberto)
-- Apenas 7 seções MADR
+- Apenas 6 seções MADR
 
 **Qualidade do Conteúdo**:
 - Nenhum bloco de código ou trecho da transcrição nas ADRs
