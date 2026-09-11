@@ -100,23 +100,25 @@ A proposta deve ser apresentada explicitamente como uma proposta, usando express
 
 Evite apresentar a proposta como uma decisão: evite "O sistema utilizará..." quando a decisão não estiver confirmada; prefira "A proposta desta RFC é utilizar...".
 
+A proposta técnica deve permanecer em nível de visão geral (o quê e por quê). Detalhamento de implementação (endpoints, esquemas de banco, nomes de classes, matriz de erros) é responsabilidade do FDD e não deve ser duplicado na RFC.
+
 ### Etapa 5 — Identificar Alternativas
 
 Documente as alternativas relevantes que tenham sido discutidas. Para cada uma, descreva: o que é, como funcionaria, vantagens, desvantagens, impacto técnico, complexidade, impacto operacional.
 
-Não invente alternativas que não tenham sido discutidas ou justificadas. Caso a análise esteja incompleta, informe explicitamente: "A análise de alternativas ainda não foi concluída."
+É necessário documentar no mínimo 2 alternativas reais que tenham sido discutidas e descartadas na reunião, cada uma com o trade-off específico que motivou o descarte. Não invente alternativas que não tenham sido discutidas ou justificadas. Caso a análise esteja incompleta ou a transcrição não traga pelo menos 2 alternativas reais, informe essa lacuna explicitamente em vez de completar com alternativas inventadas: "A análise de alternativas ainda não foi concluída."
 
 ### Etapa 6 — Identificar Trade-offs
 
 Documente os principais trade-offs da proposta, relacionados ao contexto real do sistema (ex.: simplicidade vs escalabilidade, velocidade de desenvolvimento vs flexibilidade, baixo custo vs alta disponibilidade, complexidade operacional vs independência de deploy, consistência vs disponibilidade, simplicidade inicial vs evolução futura). Não liste trade-offs genéricos sem relação com a proposta.
 
-### Etapa 7 — Identificar Riscos
+### Etapa 7 — Identificar Impacto e Riscos
 
-Identifique riscos relacionados à proposta (ex.: aumento da complexidade operacional, dependência de fornecedor externo, maior custo de infraestrutura, risco de acoplamento entre módulos, complexidade de migração, impacto em sistemas existentes). Sempre que possível, associe uma possível mitigação.
+Descreva o impacto da proposta — quem e o que é afetado (equipes, sistemas, clientes, processos existentes) — e identifique riscos relacionados (ex.: aumento da complexidade operacional, dependência de fornecedor externo, maior custo de infraestrutura, risco de acoplamento entre módulos, complexidade de migração, impacto em sistemas existentes). Sempre que possível, associe uma possível mitigação a cada risco.
 
 ## Estrutura Obrigatória da RFC
 
-A RFC final deve seguir esta estrutura:
+A RFC final deve seguir esta estrutura. O campo **Revisores** deve ser preenchido com os nomes dos participantes da reunião registrados em `transcricao.md`; se a transcrição não estiver disponível, utilize `TBD`.
 
 ```markdown
 # RFC — <Título>
@@ -125,13 +127,14 @@ A RFC final deve seguir esta estrutura:
 **Autor:** <Autor ou TBD>
 **Data:** <Data ou TBD>
 **Versão:** <Versão>
+**Revisores:** <participantes da reunião extraídos de transcricao.md, ou "TBD">
 **ADRs Relacionadas:** <lista de identificadores, ex. ADR-001, ADR-004, ou "Nenhuma">
 
 ---
 
-## 1. Resumo
+## 1. Resumo Executivo (TL;DR)
 
-<Resumo da proposta>
+<Resumo executivo da proposta em poucas frases — o que se propõe e por quê, sem detalhes de implementação>
 
 ---
 
@@ -183,9 +186,9 @@ A RFC final deve seguir esta estrutura:
 
 ---
 
-## 9. Solução Proposta
+## 9. Proposta Técnica
 
-<Descrição detalhada da proposta>
+<Visão geral da solução proposta — o quê e por quê. Não desça ao nível de detalhe de implementação: isso é responsabilidade do FDD>
 
 ---
 
@@ -233,6 +236,8 @@ A RFC final deve seguir esta estrutura:
 
 ## 17. Alternativas Consideradas
 
+<Documente no mínimo 2 alternativas reais, discutidas e descartadas na reunião, cada uma com o trade-off específico que motivou o descarte>
+
 ### Alternativa 1 — <Nome>
 
 <Descrição>
@@ -265,9 +270,9 @@ A RFC final deve seguir esta estrutura:
 
 ---
 
-## 19. Riscos
+## 19. Impacto e Riscos
 
-<Riscos e possíveis mitigações>
+<Impacto da proposta (quem e o que é afetado — equipes, sistemas, clientes) e riscos com possíveis mitigações>
 
 ---
 
@@ -279,7 +284,7 @@ A RFC final deve seguir esta estrutura:
 
 ## 21. Questões em Aberto
 
-<Questões ainda não resolvidas>
+<Questões ainda não resolvidas. Inclua no mínimo 2 pontos levantados na reunião que não foram decididos ou que foram explicitamente adiados>
 
 ---
 
@@ -375,7 +380,7 @@ Ao criar uma RFC nova, utilize `Status: Draft`. Quando estiver em processo forma
 
 ## Questões em Aberto
 
-Questões não resolvidas devem permanecer explícitas (ex.: "Qual banco de dados será utilizado?", "Qual provedor de pagamento será adotado?", "A primeira versão precisará de processamento assíncrono?", "Qual será a estratégia de autenticação?", "Existe necessidade de cache na primeira versão?"). Não responda inventando informações — utilize `TBD` quando não houver informação suficiente.
+Questões não resolvidas devem permanecer explícitas (ex.: "Qual banco de dados será utilizado?", "Qual provedor de pagamento será adotado?", "A primeira versão precisará de processamento assíncrono?", "Qual será a estratégia de autenticação?", "Existe necessidade de cache na primeira versão?"). Inclua no mínimo 2 pontos que tenham sido levantados na reunião e que não foram decididos ou que foram explicitamente adiados. Não responda inventando informações — utilize `TBD` quando não houver informação suficiente.
 
 ## Decisão Arquitetural
 
@@ -398,11 +403,13 @@ Caso uma decisão arquitetural seja confirmada, ela deverá ser registrada poste
 Antes de retornar a RFC, valide:
 
 - O problema está claramente definido? O contexto está suficientemente explicado?
-- A proposta está claramente identificada e diferenciada de uma decisão?
-- Os requisitos possuem suporte nas fontes? As alternativas foram documentadas?
+- Os revisores foram preenchidos com os participantes reais da reunião (ou `TBD` na ausência de transcrição)?
+- A proposta está claramente identificada, em nível de visão geral (sem detalhe de implementação do FDD), e diferenciada de uma decisão?
+- Os requisitos possuem suporte nas fontes?
+- Há no mínimo 2 alternativas reais discutidas e descartadas na reunião, cada uma com o trade-off que motivou o descarte?
 - Toda decisão já formalizada em uma ADR foi citada explicitamente pelo identificador (ex.: ADR-003)?
-- Os trade-offs foram explicados? Os riscos foram identificados?
-- As questões em aberto estão explícitas? As incertezas e suposições foram preservadas/identificadas?
+- Os trade-offs foram explicados? O impacto e os riscos foram identificados?
+- Há no mínimo 2 questões em aberto levantadas na reunião e não decididas/adiadas? As incertezas e suposições foram preservadas/identificadas?
 - Foram evitadas informações inventadas?
 - A proposta é tecnicamente compreensível? Outro engenheiro conseguiria entendê-la sem participar da reunião original?
 - A RFC poderia servir como base para uma futura decisão arquitetural?

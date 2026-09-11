@@ -1,332 +1,393 @@
-# RFC — Order Webhooks Notification System
+# RFC — Sistema de Webhooks de Notificação de Pedidos (Order Webhooks Notification System)
 
 **Status:** Draft
-**Autor:** TBD
-**Data:** 2026-09-08
+**Autor:** TBD (documento consolidado a partir da reunião de refinamento técnico; nenhuma autoria individual de redação foi registrada nas fontes)
+**Data:** 2026-08-31 (data da reunião de refinamento registrada em `TRANSCRICAO.md`)
 **Versão:** 1.0
+**Revisores:** Larissa (Tech Lead, condução), Marcos (Product Manager), Bruno (Engenheiro Pleno, time de Pedidos), Diego (Engenheiro Sênior, time de Plataforma), Sofia (Engenheira de Segurança)
 **ADRs Relacionadas:** ADR-001, ADR-002, ADR-003, ADR-004, ADR-005, ADR-006, ADR-007, ADR-008
 
 ---
 
-## 1. Resumo
+## 1. Resumo Executivo (TL;DR)
 
-Esta RFC descreve a arquitetura proposta para o **Order Webhooks Notification System**, uma extensão do OMS (Order Management System) existente que passa a notificar clientes B2B externos, via HTTP callback assinado, sempre que o status de um pedido muda. A proposta combina seis decisões técnicas já fechadas e formalizadas em ADRs dedicadas — outbox transacional em MySQL (`ADR-006`, com o ponto de integração descrito em `ADR-003`), retry com backoff exponencial e DLQ (`ADR-007`), worker de entrega em processo separado com polling (`ADR-008`), autenticação HMAC-SHA256 com secret por endpoint (`ADR-004`) e garantia de entrega at-least-once via `X-Event-Id` (`ADR-005`) — com decisões de infraestrutura de mais longo prazo já consolidadas no projeto (JWT stateless, `ADR-001`; Prisma como ORM único, `ADR-002`). O propósito desta RFC não é reabrir essas seis decisões pontuais, mas apresentar como elas se encaixam em um desenho arquitetural coerente, cobrir os aspectos ainda não fechados em nenhuma ADR (contrato de API do módulo `webhooks`, modelo de dados de configuração, observabilidade, riscos de integração entre as peças) e registrar as questões que permanecem em aberto.
+Três clientes B2B (Atlas Comercial, MaxDistribuição e Nova Cargo) formalizaram o pedido de serem notificados em tempo real (abaixo de 10 segundos) quando o status de seus pedidos muda no OMS, eliminando a necessidade de polling manual em `GET /orders` (`[09:00]-[09:02]` Marcos). Esta RFC propõe evoluir o OMS existente com um sistema de webhooks outbound: a mudança de status de um pedido passa a gerar, de forma atômica, um evento persistido em uma tabela de outbox no MySQL já utilizado pelo projeto; um processo worker separado, em polling, lê essa tabela e entrega os eventos via HTTP, com autenticação HMAC-SHA256, retry com backoff exponencial e Dead Letter Queue (DLQ) para falhas definitivas.
+
+As decisões estruturais centrais desta proposta — padrão outbox, autenticação HMAC por endpoint, garantia at-least-once, política de retry/DLQ e worker em processo separado — já foram fechadas por consenso na reunião de refinamento técnico e formalizadas nas ADR-003 a ADR-008. Esta RFC não reabre essas decisões; ela as integra em uma visão arquitetural única, documenta o problema e o contexto de negócio que as motivou, registra as alternativas descartadas com seus trade-offs, e mantém em aberto os pontos que a própria equipe explicitamente não decidiu (rate limiting de saída, notificação de falha ao cliente, monitoramento de DLQ, entre outros).
+
+---
 
 ## 2. Contexto
 
-Três clientes B2B — Atlas Comercial, MaxDistribuição e Nova Cargo — formalizaram um pedido para serem notificados em tempo real quando o status de seus pedidos muda na plataforma, com a Atlas sinalizando risco de migração para um concorrente caso a entrega não ocorra até o fim do trimestre (`[09:00] Marcos`). Hoje esses clientes fazem polling periódico em `GET /orders`, o que Marcos descreve como uma integração "lenta e cara" para eles (`[09:00] Marcos`). O requisito de latência aceito pelos clientes é qualquer valor abaixo de 10 segundos, tratado por eles como "tempo real" (`[09:02] Marcos`).
+O OMS (Order Management System) é uma API de gestão de pedidos B2B construída em módulos por domínio (`src/modules/{auth,users,customers,products,orders}`), com uma máquina de estados de pedido (`PENDING → PAID → PROCESSING → SHIPPED → DELIVERED`, com ramos `CANCELLED`) implementada em `src/modules/orders/order.status.ts:3-10` e orquestrada de forma transacional em `OrderService.changeStatus` (`src/modules/orders/order.service.ts:126-179`). Essa transação já debita/repõe estoque (`shouldDebitStock`/`shouldReplenishStock`, `order.status.ts:29-37`), atualiza `Order.status` e insere uma linha de auditoria em `OrderStatusHistory`.
 
-O escopo foi definido logo no início da reunião como estritamente **outbound**: a plataforma envia eventos para os clientes, e não o contrário (`[09:02]-[09:03] Sofia/Marcos`). Do ponto de vista técnico, o único ponto do sistema que hoje altera o status de um pedido é `OrderService.changeStatus` (`src/modules/orders/order.service.ts:126-179`), que já executa, dentro de um único `prisma.$transaction`, a validação da transição de estado (`canTransition`, `src/modules/orders/order.status.ts:12-14`), o débito/reposição de estoque (`shouldDebitStock`/`shouldReplenishStock`, `src/modules/orders/order.status.ts:29-37`) e a gravação de auditoria em `OrderStatusHistory` (`prisma/schema.prisma:116-131`). Essa transação foi descrita pela própria equipe como "já pesada" (`[09:04] Bruno`), o que molda diretamente a proposta desta RFC.
+Hoje o sistema não possui nenhum mecanismo de notificação assíncrona: consumidores externos só conseguem saber que um pedido mudou de status fazendo polling em `GET /orders`. Três clientes formalizaram, na semana anterior à reunião, um pedido para receber essas mudanças em tempo real (`[09:00]` Marcos), com a Atlas Comercial sinalizando risco de migração para um concorrente caso a entrega não ocorra até o fim do trimestre. A definição de "tempo real" aceita pelos clientes é qualquer latência abaixo de 10 segundos (`[09:02]` Marcos), e o fluxo é estritamente outbound — a plataforma envia, os clientes apenas recebem (`[09:02]` Sofia; `[09:02]` Marcos).
+
+Nenhuma infraestrutura de mensageria (fila, broker de eventos) é operada pelo time hoje; a única infraestrutura de dados é o MySQL, acessado via Prisma (ADR-002), e a autenticação existente é JWT stateless interno para operadores/administradores (ADR-001), sem qualquer mecanismo de autenticação para consumidores externos.
+
+---
 
 ## 3. Problema
 
-O sistema não possui hoje nenhum mecanismo de notificação assíncrona de eventos de domínio para consumidores externos — a única forma de um cliente externo saber que um pedido mudou de status é fazer polling manual e repetido em `GET /orders`. Isso gera custo de integração crescente para os clientes B2B à medida que o volume de pedidos aumenta, e cria risco comercial explícito (churn) quando esse custo ultrapassa o que o cliente está disposto a tolerar (`[09:00] Marcos`).
+Os consumidores externos (clientes B2B) do OMS não possuem hoje nenhum mecanismo de notificação de eventos de domínio: a única forma de saber que o status de um pedido mudou é fazer polling periódico em `GET /orders`, o que é lento e caro para eles operacionalmente e gera acoplamento indireto entre a frequência de polling do cliente e a percepção de atualização do sistema. Essa limitação já gerou insatisfação explícita de clientes estratégicos, com risco concreto de churn de pelo menos um deles até o fim do trimestre (`[09:00]` Marcos).
 
-Adicionalmente, qualquer solução que acople o disparo da notificação à transação síncrona de mudança de status introduz um novo problema técnico: a confiabilidade da notificação de um pedido passaria a depender da disponibilidade de um sistema de terceiro fora do controle da plataforma, com risco de travar mudanças de status de *outros* pedidos caso o cliente externo esteja lento ou indisponível (`[09:04] Bruno`), sem que exista uma forma coerente de reverter apenas a notificação em caso de falha (`[09:04] Bruno`).
+Do ponto de vista técnico, o sistema não possui hoje nenhum ponto de extensão para publicar eventos de domínio de forma assíncrona e confiável: a única fronteira transacional existente (`OrderService.changeStatus`) não tem como comunicar-se de forma segura com sistemas externos sem acoplar a disponibilidade desses sistemas à disponibilidade da própria transação de negócio.
+
+---
 
 ## 4. Objetivos
 
-- Notificar clientes B2B sobre mudanças de status de pedido em latência aceitável abaixo de 10 segundos (`[09:02] Marcos`).
-- Eliminar a dependência de polling em `GET /orders` como mecanismo primário de sincronização de estado para integradores externos.
-- Garantir que a notificação nunca fique inconsistente com o estado real do pedido — nem eventos "fantasma" sem mudança real, nem mudanças de status sem evento correspondente (`ADR-003`, `ADR-006`).
-- Não introduzir acoplamento síncrono entre a disponibilidade de sistemas de terceiros e a transação crítica de mudança de status de pedidos (`[09:04]-[09:08]`).
-- Fornecer autenticidade e integridade verificáveis do lado do cliente para cada evento recebido (`ADR-004`).
-- Reaproveitar ao máximo os padrões, mecanismos e infraestrutura já existentes no projeto — módulos, tratamento de erros, autenticação, ORM, logging — em vez de introduzir componentes novos sem necessidade (`[09:30] Larissa`; `ADR-002`).
-- Entregar a primeira versão dentro do prazo estimado de três sprints, incluindo revisão de segurança dedicada (`[09:45]-[09:47]`).
+- Permitir que clientes B2B sejam notificados de mudanças de status de pedidos com latência aceitável abaixo de 10 segundos, sem depender de polling (`[09:02]` Marcos).
+- Garantir que a notificação nunca fique inconsistente com o estado real do pedido: se o status mudou, o evento deve existir; se a transação de mudança de status falhar, o evento não deve existir (`[09:40]-[09:41]` Bruno/Diego — formalizado em ADR-003/ADR-006).
+- Não introduzir acoplamento síncrono entre a disponibilidade de sistemas externos de clientes e a capacidade do sistema de mudar o status de outros pedidos (`[09:04]` Bruno).
+- Fornecer um mecanismo de autenticação e integridade verificável para os eventos entregues a terceiros (ADR-004).
+- Reaproveitar ao máximo os padrões arquiteturais já estabelecidos no projeto — módulos por domínio, `AppError`, Pino, error middleware centralizado, Prisma/`PrismaClient`, RBAC via `requireRole` — em vez de introduzir novos padrões ou nova infraestrutura (`[09:30]` Larissa).
+- Entregar a primeira versão da feature dentro da estimativa de três sprints comunicada ao time (`[09:45]-[09:46]` Larissa), incluindo revisão de segurança dedicada da Sofia antes do deploy.
+
+---
 
 ## 5. Fora do Escopo
 
-- Notificação por e-mail em caso de falhas recorrentes de entrega — adiado explicitamente para uma fase futura (`[09:37]-[09:38] Marcos/Larissa`).
-- Rate limiting de envio de webhooks para um mesmo cliente em rajadas de eventos — a equipe optou por observar o comportamento em produção antes de decidir implementar (`[09:38]-[09:39] Diego/Larissa`).
-- Dashboard visual para o cliente acompanhar seus webhooks — tratado como projeto separado do time de frontend, fora do escopo desta feature (`[09:39]-[09:40] Larissa`).
-- Garantia de ordering global de entrega entre pedidos distintos — a ordenação é assegurada apenas por `order_id` e apenas enquanto houver um único worker em execução (`[09:12]-[09:13]`, `ADR-008`).
-- Arquivamento/purga de eventos já entregues na tabela de outbox — mencionado como necessidade futura, mas explicitamente fora do escopo desta feature (`[09:08] Diego`).
-- Suporte a webhooks *inbound* (clientes enviando dados para a plataforma) — descartado no início da reunião (`[09:02]-[09:03] Sofia/Marcos`).
-- Evolução da topologia de worker para múltiplos processos em paralelo, incluindo particionamento por `order_id` ou lock pessimista — declarada como problema de arquitetura futuro, fora do escopo atual (`[09:13] Diego`; `ADR-006`; `ADR-008`).
-- Modelo de permissão granular por `customer_id` para os endpoints de configuração de webhook — o time optou por manter esses endpoints abertos a qualquer role autenticada "por enquanto" (`[09:36]-[09:37] Sofia/Marcos`), sem desenhar o modelo de permissão mais fino nesta fase.
+- Envio de webhooks inbound (clientes enviando dados para a plataforma) — o fluxo é estritamente outbound (`[09:02]` Sofia/Marcos).
+- Notificação alternativa por e-mail em caso de falhas recorrentes de entrega — explicitamente adiada para uma fase futura, após medição de impacto (`[09:37]-[09:38]` Larissa/Marcos).
+- Rate limiting de envio de webhooks para clientes com alto volume de eventos simultâneos — reconhecido como ponto relevante, mas deliberadamente deixado como "observar e decidir depois" (`[09:38]-[09:39]` Diego/Larissa).
+- Dashboard visual para o cliente gerenciar seus webhooks — fora de escopo desta fase; a interação é somente via API, com o time de frontend tratando um eventual painel como projeto separado (`[09:39]-[09:40]` Larissa/Marcos).
+- Endurecimento futuro de RBAC no CRUD de configuração de webhook (ex.: exigir role mais restritiva do que "qualquer usuário autenticado") — mencionado como possibilidade futura, não decidido nesta fase (`[09:36]-[09:37]` Marcos/Sofia).
+- Arquivamento/purga de eventos já entregues na outbox após 30 dias — mencionado como necessidade futura, mas explicitamente fora do escopo desta feature (`[09:08]` Diego).
+- Suporte a múltiplos workers em paralelo com garantia de ordering global — tratado como evolução futura fora do escopo desta decisão (`[09:12]-[09:13]` Diego/Bruno; ADR-006, ADR-008).
+- Detalhamento de endpoints, schemas de request/response, matriz de erros `WEBHOOK_*` e modelagem física completa das tabelas — responsabilidade do FDD, não desta RFC.
+
+---
 
 ## 6. Requisitos
 
 ### 6.1 Requisitos Funcionais
 
-- O cliente (via usuário autenticado do OMS) deve poder cadastrar um webhook informando `url`, `customer_id` e a lista de status de pedido que deseja receber; a `secret` é gerada pela plataforma e devolvida na criação (`[09:31]-[09:32] Marcos`).
-- O sistema deve permitir editar (`PATCH`), remover (`DELETE`) e listar (`GET`) os webhooks cadastrados de um customer (`[09:33] Bruno`).
-- O sistema deve permitir configurar, por endpoint de webhook, quais status de pedido disparam notificação (filtro de eventos) (`[09:33]-[09:34] Marcos/Bruno`).
-- A filtragem de eventos deve ocorrer no momento da inserção na outbox: se nenhum webhook do customer estiver interessado naquele status, o evento não deve ser inserido (`[09:34] Bruno/Diego`).
-- O sistema deve expor o histórico de entregas de um webhook (`GET /webhooks/:id/deliveries`), incluindo sucesso/falha, payload, response e tempo de resposta, para as últimas entregas (`[09:34]-[09:35] Marcos`; quantidade referida como "últimos 100" nesse trecho da transcrição, sem constar como limite formalmente decidido — ver seção 21).
-- O sistema deve fornecer um endpoint administrativo para reprocessar manualmente um evento em DLQ (`POST /admin/webhooks/dead-letter/:id/replay`), recolocando-o na outbox como pendente (`[09:18] Diego`; `[09:35] Larissa`; `ADR-007`).
-- O endpoint de replay de DLQ deve exigir role `ADMIN` e registrar log de auditoria de quem executou o replay (`[09:35]-[09:36] Sofia/Larissa`; `ADR-007`).
-- A rotação de secret de um endpoint de webhook deve ser possível via API, mantendo a secret antiga válida por 24 horas em paralelo à nova (`[09:21]-[09:22] Sofia`; `ADR-004`).
-- O payload do evento deve conter, no mínimo: `event_id`, `event_type` (ex.: `"order.status_changed"`), `timestamp` ISO 8601, `order_id`, `order_number`, `from_status`, `to_status`, `customer_id` e campos básicos do pedido como `total_cents` — sem incluir os itens do pedido, para manter o payload enxuto (`[09:43] Diego`).
-- Os cabeçalhos de cada requisição de webhook devem incluir `X-Event-Id`, `X-Signature`, `X-Timestamp` e `X-Webhook-Id`, além de `Content-Type: application/json` (`[09:44]-[09:45] Diego/Sofia`).
+- O cliente deve poder cadastrar um webhook informando URL de destino e a lista de status de pedido que deseja receber; a secret de assinatura é gerada pela plataforma e devolvida na criação (`[09:31]` Marcos).
+- O cliente deve poder editar (`PATCH`), remover (`DELETE`) e listar (`GET`) os webhooks cadastrados para um customer (`[09:33]` Bruno).
+- O sistema deve filtrar, no momento da inserção do evento na outbox, quais webhooks daquele customer estão interessados no status resultante da transição, evitando inserir eventos para webhooks que não os solicitaram (`[09:33]-[09:34]` Marcos/Bruno/Diego).
+- O cliente deve poder consultar o histórico de entregas de um webhook (últimos eventos enviados, sucesso/falha, payload, response, tempo de resposta) via `GET /webhooks/:id/deliveries` (`[09:34]` Marcos).
+- Deve existir um endpoint administrativo para reprocessar manualmente um evento em DLQ, recolocando-o na outbox como pendente (`POST /admin/webhooks/dead-letter/:id/replay`), restrito a usuários com role `ADMIN` (`[09:18]`, `[09:35]-[09:36]` Diego/Sofia/Larissa).
+- O endpoint de replay administrativo deve registrar em log de auditoria qual usuário administrador executou cada replay (`[09:36]` Sofia).
+- O cliente deve poder rotacionar a secret de um webhook via API, com a secret antiga permanecendo válida por 24 horas em paralelo à nova (`[09:21]` Sofia).
+- Cada evento entregue deve carregar um identificador único (`event_id`) que permanece o mesmo em todas as tentativas de reenvio, permitindo deduplicação do lado do cliente (`[09:25]` Diego — ADR-005).
+- O restante do CRUD de configuração de webhook (criar/editar/remover/listar) deve exigir apenas autenticação JWT válida, sem exigência de role específica nesta fase (`[09:36]-[09:37]` Sofia).
 
 ### 6.2 Requisitos Não Funcionais
 
-- **Performance/Latência:** entrega em até 10 segundos é o requisito aceito pelo cliente; o desenho com polling de 2 segundos atende esse requisito com folga (`[09:02] Marcos`; `[09:09]-[09:10]`; `ADR-008`).
-- **Confiabilidade:** garantia de entrega at-least-once, nunca exactly-once (`ADR-005`); nenhuma falha definitiva deve ser descartada silenciosamente — toda falha esgotada vai para DLQ (`ADR-007`).
-- **Segurança:** autenticidade e integridade via HMAC-SHA256 com secret por endpoint (`ADR-004`); TLS obrigatório — a plataforma deve recusar cadastro de URL de webhook que não seja `https` (`[09:23] Sofia`, tratado como validação de schema Zod e não como decisão arquitetural separada).
-- **Segurança/limite de payload:** eventos que ultrapassem 64KB não devem ser enviados; a plataforma deve retornar/registrar erro em vez de truncar o payload (`[09:23]-[09:24] Sofia/Diego/Larissa`, também tratado como requisito não funcional, não como decisão arquitetural separada).
-- **Resiliência:** timeout de 10 segundos por chamada HTTP do worker antes de considerar falha e acionar retry (`[09:42] Diego`; `ADR-007`).
-- **Disponibilidade operacional:** a entrega de webhooks não pode ser interrompida por reinício/deploy do processo da API (`[09:11] Diego`; `ADR-008`).
-- **Manutenibilidade:** o novo módulo deve seguir a mesma estrutura de camadas (`controller → service → repository → routes` + `schemas`) já usada pelos demais domínios do projeto (`[09:27]-[09:28] Bruno`).
-- **Observabilidade:** TBD além do reuso do logger Pino e do middleware de erro já existentes — não há decisão registrada sobre métricas ou tracing dedicados ao módulo de webhooks (ver seção 16 e 21).
+- **Performance/Latência:** entrega de eventos com latência inferior a 10 segundos no caso comum; o pior caso aceito nesta proposta é de 2 segundos apenas pela cadência de polling do worker, folgado frente ao requisito de negócio (`[09:09]-[09:10]` Diego/Marcos/Larissa — ADR-008).
+- **Confiabilidade/Consistência:** garantia transacional de que a mudança de status de um pedido e o registro do evento correspondente ocorrem atomicamente — nunca um sem o outro (`[09:06]-[09:08]` Diego — ADR-003, ADR-006).
+- **Disponibilidade:** o processo de entrega de webhooks (worker) não deve ser afetado por reinícios/deploys do processo da API, e vice-versa (`[09:11]` Diego — ADR-008).
+- **Segurança:** autenticidade e integridade de cada evento verificável pelo cliente via HMAC-SHA256, com secret exclusiva por endpoint cadastrado (`[09:19]-[09:22]` Sofia — ADR-004); comunicação obrigatoriamente via HTTPS (`[09:23]` Sofia).
+- **Segurança:** limite de tamanho de payload de 64KB, com erro explícito em caso de excesso, em vez de truncamento silencioso (`[09:23]-[09:24]` Sofia/Diego).
+- **Resiliência:** tolerância a indisponibilidade de cliente por até aproximadamente 15 horas via retry com backoff exponencial antes de mover o evento para DLQ (`[09:14]-[09:17]` Diego/Bruno/Larissa — ADR-007).
+- **Observabilidade:** histórico de entregas (sucesso/falha, payload, response, tempo de resposta) deve ser consultável pelo cliente via API (`[09:34]` Marcos), e falhas definitivas devem ficar auditáveis em DLQ com motivo registrado (`[09:18]` Diego — ADR-007).
+- **Manutenibilidade:** o novo módulo deve seguir a convenção estrutural existente (`*.routes.ts → *.controller.ts → *.service.ts → *.repository.ts` + `*.schemas.ts`) e o prefixo de erro `WEBHOOK_*` alinhado à hierarquia `AppError` já existente (`[09:27]-[09:29]` Bruno — `src/shared/errors/app-error.ts`, `src/shared/errors/http-errors.ts`).
+- **Escalabilidade:** o desenho aceita, nesta fase, um único worker (`single-worker`) como premissa de ordering; capacidade de múltiplos workers em paralelo é TBD e depende de trabalho futuro de particionamento ou lock pessimista (`[09:12]-[09:13]` Diego/Bruno — ADR-006, ADR-008).
+- Volume esperado de eventos, número de clientes simultâneos e throughput-alvo do worker: **TBD** — não há qualquer número, métrica ou projeção de tráfego nas fontes disponíveis.
+
+---
 
 ## 7. Restrições
 
-- **Stack tecnológica existente:** MySQL como banco relacional (`prisma/schema.prisma:5-9`), sem mecanismo nativo de notificação assíncrona a processos externos (`ADR-006`, `ADR-008`) — restringe as opções viáveis de leitura da outbox a polling.
-- **Time pequeno, sem infraestrutura de mensageria operada:** motivou a rejeição de filas externas dedicadas (ex.: Redis Streams) por overengineering (`[09:07] Diego`; `ADR-006`).
-- **Padrões de projeto já estabelecidos e que devem ser reaproveitados:** estrutura de módulo (`src/modules/{domínio}/*.routes.ts → *.controller.ts → *.service.ts → *.repository.ts` + `*.schemas.ts`), hierarquia `AppError`/`errorCode` (`src/shared/errors/app-error.ts`, `src/shared/errors/http-errors.ts`), middleware de erro centralizado (`src/middlewares/error.middleware.ts`), logger Pino (`src/shared/logger`), autenticação JWT/RBAC via `authenticate`/`requireRole` (`src/middlewares/auth.middleware.ts:27-61`; `ADR-001`) e Prisma como ORM único (`ADR-002`) (`[09:30] Larissa`).
-- **Convenção de identificadores:** todo o schema atual usa UUID (`@db.Char(36)`) como chave primária em todas as entidades (`prisma/schema.prisma`); a nova outbox e o `event_id` seguem a mesma convenção (`[09:50]-[09:51] Larissa/Diego`; `ADR-005`).
-- **Topologia de processos:** até esta feature, o projeto opera com um único processo Node de longa duração (`src/server.ts`); a introdução do worker (`src/worker.ts`) é a primeira vez que o sistema passa a operar dois processos coordenados apenas pelo banco compartilhado (`ADR-008`).
-- **Prazo comercial:** a Atlas solicitou entrega até o fim de novembro; a equipe estimou três sprints, incluindo revisão de segurança dedicada de pelo menos dois dias úteis antes do deploy (`[09:45]-[09:47] Marcos/Larissa/Sofia`).
-- **Modelo de permissão binário existente:** o RBAC atual (`ADMIN`/`OPERATOR`) não possui conceito de escopo por `customer_id`; os endpoints CRUD de configuração de webhook ficam abertos a qualquer role autenticada nesta fase (`[09:36]-[09:37]`), o que é uma restrição herdada do modelo de autenticação existente (`ADR-001`) e não uma limitação nova desta feature.
+- **Stack tecnológica:** o projeto usa MySQL como único banco de dados via Prisma ORM (ADR-002); não há orçamento, aprovação ou intenção registrada de introduzir um segundo sistema de dados/mensageria (`[09:07]` Diego).
+- **Equipe pequena:** a decisão de reaproveitar MySQL em vez de subir Redis Streams ou fila dedicada foi motivada explicitamente pelo tamanho reduzido do time e pelo risco de overengineering (`[09:07]` Diego).
+- **Ausência de mecanismo reativo no MySQL:** diferente do PostgreSQL, o MySQL não oferece `LISTEN/NOTIFY`; triggers de banco só executam SQL e não conseguem acionar processos externos, restringindo a leitura da outbox a polling (`[09:09]` Diego — ADR-008).
+- **Autenticação interna já estabelecida:** o mecanismo JWT/RBAC (`authenticate`, `requireRole` em `src/middlewares/auth.middleware.ts:27-61`) é reaproveitado sem alteração para os endpoints de configuração de webhook e para o endpoint administrativo de replay (ADR-001).
+- **Padrão de erros já estabelecido:** qualquer novo erro do módulo de webhooks deve seguir a hierarquia `AppError` (`src/shared/errors/app-error.ts`, `src/shared/errors/http-errors.ts`) com códigos prefixados `WEBHOOK_*` (`[09:28]` Bruno).
+- **Prazo comercial:** a Atlas Comercial condicionou a continuidade do contrato à entrega até o fim do trimestre (`[09:00]` Marcos); a estimativa de entrega é de três sprints, incluindo revisão de segurança da Sofia (`[09:45]-[09:46]` Larissa).
+- **Incidente de segurança prévio:** a exigência de secret única por endpoint (em vez de secret global) é motivada por um incidente real já ocorrido, em que um cliente vazou uma secret em log de sua própria aplicação (`[09:22]` Diego — ADR-004).
+- **Convenção de identificadores:** todas as entidades do schema atual usam UUID como chave primária; a nova tabela de outbox deve seguir a mesma convenção (`[09:50]-[09:51]` Larissa/Diego).
+- Requisitos regulatórios/compliance específicos (ex.: LGPD sobre dados de pedido trafegados a terceiros): **TBD** — não mencionados em nenhuma fonte disponível.
+- Limitações de orçamento de infraestrutura: **TBD** — não quantificadas nas fontes.
+
+---
 
 ## 8. ADRs Relacionadas e Decisões Já Confirmadas
 
-Todas as decisões abaixo são tratadas como **fundação confirmada** desta RFC, não como propostas em aberto. A RFC não redebate nenhuma delas; ela descreve como se encaixam no desenho arquitetural mais amplo.
+| ADR | Título | Relação com esta RFC |
+|---|---|---|
+| **ADR-001** | Estratégia de Autenticação JWT Stateless com Hash de Senha via bcrypt | **Fundação reaproveitada.** O mecanismo `authenticate`/`requireRole` já existente é usado sem alteração para proteger os endpoints de configuração de webhook (autenticação básica) e o endpoint administrativo de replay de DLQ (exigência de role `ADMIN`). Esta RFC não propõe nenhuma mudança ao modelo de autenticação interno. |
+| **ADR-002** | Prisma como ORM Único e PrismaClient em Singleton por Processo | **Fundação reaproveitada e estendida.** Toda a persistência de outbox, configuração de webhook e DLQ propostas nesta RFC usa Prisma sobre o MySQL existente. A ADR-002 já confirma explicitamente a extensão do padrão de singleton de `PrismaClient` por processo para a nova topologia de dois processos (API + worker) introduzida por esta proposta. |
+| **ADR-003** | Publicação Atômica de Eventos de Webhook via Outbox dentro de `OrderService.changeStatus` | **Decisão confirmada, citada diretamente.** Define o ponto de integração exato desta proposta: a inserção do evento ocorre dentro da mesma transação de `changeStatus` via uma função pura `publishWebhookEvent(tx, order, fromStatus, toStatus)`, em vez de injeção de um `WebhookRepository` completo. Esta RFC herda essa decisão sem reabri-la. |
+| **ADR-004** | Autenticação de Webhooks via HMAC-SHA256 com Secret Única por Endpoint e Rotação | **Decisão confirmada, citada diretamente.** Define o mecanismo de segurança de toda entrega proposta nesta RFC: HMAC-SHA256 sobre o corpo do evento, secret exclusiva por endpoint cadastrado, rotação via API com grace period de 24h. |
+| **ADR-005** | Garantia de Entrega At-Least-Once com Idempotência via X-Event-Id | **Decisão confirmada, citada diretamente.** Define a semântica de entrega assumida por toda a proposta: at-least-once, com deduplicação delegada ao cliente via `X-Event-Id` (UUID gerado na inserção do evento na outbox e propagado em retries). |
+| **ADR-006** | Padrão Outbox no MySQL para Entrega de Eventos de Webhook | **Decisão confirmada, citada diretamente.** Formaliza o uso do MySQL existente (via tabela `webhook_outbox`, ainda a ser criada) como mecanismo de outbox, descartando fila externa dedicada e disparo síncrono. Esta RFC adota essa decisão como base arquitetural central. |
+| **ADR-007** | Política de Retry com Backoff Exponencial e Dead Letter Queue | **Decisão confirmada, citada diretamente.** Define a política de resiliência de entrega: 5 tentativas com backoff de 1m/5m/30m/2h/12h, DLQ em tabela dedicada (`webhook_dead_letter`) e endpoint administrativo de replay restrito a `ADMIN`. |
+| **ADR-008** | Worker de Entrega em Processo Separado com Polling | **Decisão confirmada, citada diretamente.** Define a topologia de execução do consumidor de eventos: processo Node separado (`src/worker.ts`), polling a cada 2 segundos, `PrismaClient` próprio por processo. Esta RFC adota essa decisão como parte da arquitetura de entrega. |
 
-- **`ADR-001` — Estratégia de Autenticação JWT Stateless com Hash de Senha via bcrypt.** Status: Aceita. Fundamenta esta RFC ao definir que todos os endpoints CRUD de configuração de webhook e o endpoint administrativo de replay de DLQ reutilizam o mecanismo `authenticate`/`requireRole` já existente (`src/middlewares/auth.middleware.ts:27-61`), sem necessidade de um novo esquema de autenticação para usuários internos.
-- **`ADR-002` — Prisma como ORM Único e PrismaClient em Singleton por Processo.** Status: Aceita. Restringe e fundamenta o modelo de persistência: toda nova tabela (outbox, DLQ, configuração de webhook) será modelada em `prisma/schema.prisma` e acessada via Prisma Client; a topologia de dois processos (API + worker) deve manter uma instância própria de `PrismaClient` por processo, apontando para a mesma `DATABASE_URL`.
-- **`ADR-003` — Publicação Atômica de Eventos de Webhook via Outbox dentro de `OrderService.changeStatus`.** Status: Proposta (decisão fechada em reunião, aguardando implementação). Define o ponto de integração exato entre o domínio ORDERS e o módulo WEBHOOKS: a função pura `publishWebhookEvent(tx, order, fromStatus, toStatus)`, chamada dentro da transação já existente em `changeStatus` (`src/modules/orders/order.service.ts:126-179`), em vez de injeção de um `WebhookRepository` completo.
-- **`ADR-004` — Autenticação de Webhooks via HMAC-SHA256 com Secret Única por Endpoint e Rotação.** Status: Proposta. Fundamenta a seção de Segurança desta RFC: assinatura HMAC-SHA256 do corpo de cada evento, secret única por endpoint cadastrado (não secret global) e rotação com grace period de 24h.
-- **`ADR-005` — Garantia de Entrega At-Least-Once com Idempotência via X-Event-Id.** Status: Aceita. Fundamenta o contrato de entrega: a plataforma não garante exactly-once; cabe ao cliente deduplicar via `X-Event-Id`, um UUID gerado na inserção do evento na outbox e reenviado inalterado em cada retentativa.
-- **`ADR-006` — Padrão Outbox no MySQL para Entrega de Eventos de Webhook.** Status: Proposta. Fundamenta a escolha estrutural central desta RFC: outbox transacional sobre o MySQL existente, descartando envio síncrono e fila externa dedicada, com um worker assíncrono separado consumindo a tabela.
-- **`ADR-007` — Política de Retry com Backoff Exponencial e Dead Letter Queue.** Status: Aceita. Fundamenta o comportamento de resiliência do worker: 5 tentativas com backoff de 1m/5m/30m/2h/12h, DLQ em tabela dedicada `webhook_dead_letter`, endpoint administrativo de replay restrito a `ADMIN` com auditoria.
-- **`ADR-008` — Worker de Entrega em Processo Separado com Polling.** Status: Proposta. Fundamenta a topologia de execução: processo Node dedicado (`src/worker.ts`, script `npm run worker`), polling a cada 2 segundos, instância própria de `PrismaClient`, isolado do ciclo de vida da API.
+Não há, nas fontes disponíveis, nenhuma ADR relacionada a rate limiting de saída, notificação de falha ao cliente por e-mail, ou monitoramento/purga de DLQ — esses temas permanecem como questões em aberto (Seção 21) e não como decisões confirmadas.
 
-Não há ADR relacionada, até o momento, cobrindo o modelo de dados de **configuração** de webhook (tabela de cadastro de endpoint/secret/customer_id/status ativo) nem o contrato de API completo dos endpoints CRUD — esses aspectos são tratados nesta RFC como parte do desenho mais amplo ainda não fechado em ADR individual (ver seções 12 e 13).
+---
 
-## 9. Solução Proposta
+## 9. Proposta Técnica
 
-Esta RFC propõe estruturar o Order Webhooks Notification System como um novo módulo de domínio, `src/modules/webhooks`, seguindo o mesmo padrão de camadas dos módulos existentes (`[09:27]-[09:28] Bruno`), composto por:
+Esta RFC propõe estender o OMS existente com um módulo de webhooks outbound (`src/modules/webhooks`, seguindo a convenção estrutural já usada pelos demais domínios) e um processo worker dedicado (`src/worker.ts`), sem introduzir nenhum componente de infraestrutura novo além do MySQL já operado pelo time.
 
-1. Uma **tabela de configuração de webhooks** (nome exato do model ainda não definido — ver seção 21), armazenando `url`, `secret`, `customer_id`, lista/filtro de status desejados e estado ativo/inativo (`[09:21] Bruno`).
-2. A tabela `webhook_outbox`, populada dentro da mesma transação de `OrderService.changeStatus` via a função `publishWebhookEvent(tx, order, fromStatus, toStatus)` (`ADR-003`, `ADR-006`), com o payload já renderizado como snapshot no momento da inserção (`[09:51]-[09:52] Larissa/Diego/Bruno`).
-3. Um processo worker dedicado (`src/worker.ts`), rodando em polling de 2 segundos, responsável por ler eventos pendentes, assiná-los com HMAC-SHA256, enviá-los via HTTP e classificar o resultado (`ADR-008`).
-4. Uma política de retry com backoff exponencial e uma tabela `webhook_dead_letter` para falhas esgotadas, com endpoint administrativo de replay (`ADR-007`).
-5. Endpoints REST de CRUD de configuração de webhook e de consulta de histórico de entregas, protegidos pela autenticação JWT existente (`ADR-001`), com o endpoint de replay de DLQ restrito à role `ADMIN`.
+A abordagem proposta é: quando `OrderService.changeStatus` (`src/modules/orders/order.service.ts:126-179`) completa com sucesso uma transição de status, a mesma transação SQL passa a inserir um evento snapshot (`event_id`, tipo, timestamps, dados básicos do pedido) na tabela de outbox, restrito aos webhooks daquele customer que declararam interesse no status resultante (ADR-003, ADR-006). Essa inserção usa uma função pura que recebe o client de transação já aberto, evitando acoplar o módulo de pedidos a um repositório completo do módulo de webhooks.
 
-A proposta desta RFC — no que ainda não está coberto por ADR individual — é que o módulo `webhooks` exponha essas responsabilidades de forma coesa, mantendo `OrderService` desacoplado de detalhes de persistência do módulo WEBHOOKS (apenas a função pura `publishWebhookEvent` cruza a fronteira, por decisão já fechada em `ADR-003`), e que o worker seja tratado como um segundo "consumidor" interno do mesmo banco, sem qualquer acoplamento em tempo de execução com o processo da API além do banco compartilhado.
+Um processo Node separado, o worker (ADR-008), varre periodicamente a outbox em polling e realiza as chamadas HTTP de entrega, assinando cada payload com HMAC-SHA256 e uma secret exclusiva do endpoint de destino (ADR-004). A entrega segue garantia at-least-once, com um identificador único (`X-Event-Id`) propagado em todas as tentativas para permitir deduplicação do lado do cliente (ADR-005). Falhas de entrega acionam uma política de retry com backoff exponencial; após esgotadas as tentativas, o evento é movido para uma tabela de Dead Letter Queue dedicada, reprocessável manualmente por um endpoint administrativo restrito a `ADMIN` (ADR-007).
+
+A proposta desta RFC não introduz decisões novas além do que já foi fechado nas ADR-003 a ADR-008 — sua contribuição é articular essas decisões como uma arquitetura coesa, situá-las no contexto de negócio que as originou, e expor claramente o que ainda não foi decidido. Detalhamento de endpoints, schemas de request/response e a matriz completa de erros `WEBHOOK_*` ficam a cargo do FDD.
+
+---
 
 ## 10. Arquitetura
 
+A arquitetura proposta introduz, pela primeira vez no projeto, uma topologia de dois processos Node coordenados exclusivamente pelo banco de dados compartilhado (ADR-002, ADR-008): o processo HTTP da API (`src/server.ts`, existente) e um novo processo worker (`src/worker.ts`, proposto).
+
 ```mermaid
-flowchart TD
-    subgraph API["Processo API (src/server.ts)"]
-        OrderCtrl["OrderController"] --> OrderSvc["OrderService.changeStatus\n(order.service.ts:126-179)"]
-        OrderSvc -->|"mesma tx"| TxDB[("MySQL: orders,\norder_status_history,\nwebhook_outbox")]
-        WebhookCtrl["WebhookController\n(CRUD + deliveries)"] --> WebhookSvc["WebhookService"]
-        AdminCtrl["Admin Controller\n(replay DLQ)"] --> WebhookSvc
-        WebhookSvc --> TxDB
+flowchart LR
+    subgraph API_Process["Processo API (src/server.ts)"]
+        OS["OrderService.changeStatus\n(order.service.ts:126-179)"]
+        PWE["publishWebhookEvent(tx, ...)"]
+        OS -->|mesma transacao| PWE
     end
 
-    subgraph Worker["Processo Worker (src/worker.ts) — polling 2s"]
-        Poll["Loop de polling"] -->|"lê pendentes"| TxDB
-        Poll --> Sign["Assina HMAC-SHA256\n(ADR-004)"]
-        Sign --> Send["POST HTTP\ntimeout 10s"]
-        Send -->|"sucesso"| MarkDone["marca entregue"]
-        Send -->|"falha"| Retry["backoff 1m/5m/30m/2h/12h\n(ADR-007)"]
-        Retry -->|"5 tentativas esgotadas"| DLQ[("webhook_dead_letter")]
-        MarkDone --> TxDB
-        Retry --> TxDB
-        DLQ --> TxDB
+    subgraph DB["MySQL (Prisma)"]
+        OUT[("webhook_outbox")]
+        DLQ[("webhook_dead_letter")]
+        CFG[("webhook_config")]
     end
 
-    Send -->|"X-Event-Id, X-Signature,\nX-Timestamp, X-Webhook-Id"| Cliente["Endpoint HTTPS\ndo cliente B2B"]
-    DLQ -.->|"POST /admin/webhooks/dead-letter/:id/replay\n(role ADMIN)"| AdminCtrl
+    subgraph Worker_Process["Processo Worker (src/worker.ts)"]
+        POLL["Polling loop (2s)"]
+        SEND["Envio HTTP + HMAC-SHA256"]
+        RETRY["Backoff exponencial\n1m/5m/30m/2h/12h"]
+    end
+
+    Cliente["Endpoint HTTPS do cliente B2B\n(Atlas, MaxDistribuicao, Nova Cargo)"]
+
+    PWE -->|insere evento, mesma tx| OUT
+    CFG -.consultado na insercao.-> PWE
+    POLL --> OUT
+    OUT --> SEND
+    SEND -->|X-Signature, X-Event-Id, X-Webhook-Id, X-Timestamp| Cliente
+    Cliente -->|2xx| POLL
+    Cliente -->|erro/timeout| RETRY
+    RETRY -->|esgotadas 5 tentativas| DLQ
+    DLQ -->|POST /admin/webhooks/dead-letter/:id/replay\nrole ADMIN| OUT
 ```
 
-A API e o worker são processos independentes, coordenados exclusivamente pelo estado persistido no MySQL (`ADR-008`) — não há chamada direta entre os dois processos. A atomicidade entre a mudança de status e o registro do evento é garantida inteiramente dentro da transação de `changeStatus` (`ADR-003`, `ADR-006`); tudo o que ocorre depois do commit (assinatura, envio HTTP, retry, DLQ) é responsabilidade exclusiva do worker.
+Ambos os processos mantêm sua própria instância de `PrismaClient`, apontando para a mesma `DATABASE_URL` (ADR-002), sem nenhum mecanismo de coordenação além do próprio banco. Não há fila externa, broker de mensagens ou serviço de notificação de terceiros nesta proposta — toda a coordenação entre "produção" do evento (API) e "consumo" (worker) passa pela tabela de outbox no MySQL.
+
+---
 
 ## 11. Componentes e Domínios
 
-Consistente com a estrutura observada em `src/modules/{auth,users,customers,products,orders}/`, cada um seguindo `*.routes.ts → *.controller.ts → *.service.ts → *.repository.ts` (+ `*.schemas.ts`), a proposta é:
+- **Módulo `orders` (existente, estendido):** `OrderService.changeStatus` passa a invocar `publishWebhookEvent(tx, order, fromStatus, toStatus)` dentro da mesma transação já existente, sem incorporar lógica de persistência do módulo de webhooks (ADR-003).
+- **Módulo `webhooks` (novo, proposto):** segue a convenção estrutural do projeto (`*.routes.ts → *.controller.ts → *.service.ts → *.repository.ts` + `*.schemas.ts`), conforme proposto por Bruno em `[09:27]-[09:28]`. Responsável por:
+  - CRUD de configuração de webhook (URL, secret, status de interesse, customer).
+  - Consulta de histórico de entregas.
+  - Endpoint administrativo de replay de DLQ.
+  - Função `publishWebhookEvent` consumida por `OrderService`.
+  - Lógica de processamento/envio, proposta em `[09:28]` Bruno como um arquivo dentro do módulo (ex.: `webhook.worker.ts` ou `webhook.processor.ts`).
+- **Processo `worker` (novo, proposto):** entry-point separado `src/worker.ts`, espelhando a estrutura de `src/server.ts`, responsável por executar o loop de polling, orquestrar retries e mover eventos esgotados para DLQ (ADR-008).
+- **Infraestrutura compartilhada reaproveitada, sem alteração:** `AppError`/hierarquia de erros (`src/shared/errors/`), logger Pino (`src/shared/logger/`), `error.middleware.ts`, `auth.middleware.ts` (`authenticate`/`requireRole`), `src/config/database.ts` (padrão de singleton de `PrismaClient` por processo) e `src/config/env.ts` (validação Zod de variáveis de ambiente).
 
-- **`src/modules/webhooks/webhook.routes.ts`** — rotas de CRUD de configuração e de histórico de entregas, montadas via `authenticate` (`ADR-001`), seguindo o padrão de `src/routes/index.ts:21-31` (`buildApiRouter` agregando roteadores por módulo).
-- **`src/modules/webhooks/webhook.controller.ts`**, **`webhook.service.ts`**, **`webhook.repository.ts`**, **`webhook.schemas.ts`** — camadas equivalentes às já existentes em `src/modules/orders/`.
-- **`src/modules/webhooks/webhook.worker.ts` ou `webhook.processor.ts`** — lógica de processamento (leitura da outbox, assinatura, envio, retry) referenciada como possível nome de arquivo na reunião, sem decisão fechada sobre qual dos dois nomes usar (`[09:28] Bruno`; ver seção 21).
-- **`src/worker.ts`** — novo entry-point de processo, análogo estruturalmente a `src/server.ts`, com script `npm run worker` (`ADR-008`).
-- **Integração com `src/modules/orders/order.service.ts`** — a única alteração no módulo ORDERS é a chamada a `publishWebhookEvent(tx, ...)` dentro de `changeStatus` (`ADR-003`); nenhuma outra mudança estrutural no domínio de pedidos é proposta.
-- **Reuso transversal:** `src/shared/errors/app-error.ts` e `src/shared/errors/http-errors.ts` como base para novos erros `WEBHOOK_*`; `src/middlewares/error.middleware.ts` sem alteração, pois já trata qualquer `AppError`, `ZodError` e erros conhecidos do Prisma; `src/shared/logger` para logging do worker e do módulo `webhooks`; `src/config/database.ts` como padrão de criação do `PrismaClient` também para o worker (`ADR-002`).
+---
 
 ## 12. Dados e Persistência
 
-Nenhuma das tabelas abaixo existe hoje em `prisma/schema.prisma` — são todas propostas novas:
+O schema atual (`prisma/schema.prisma`) não possui nenhum modelo relacionado a webhooks, outbox ou eventos — todos os modelos existentes (`User`, `Customer`, `Product`, `Order`, `OrderItem`, `OrderStatusHistory`, `OrderNumberSequence`) são exclusivamente do domínio de pedidos. Esta proposta requer a criação de novos modelos Prisma, mantendo a convenção de UUID como chave primária já usada em todo o schema (`[09:50]-[09:51]` Larissa/Diego):
 
-- **Tabela de configuração de webhook** (nome do model ainda não definido — `QUESTÃO EM ABERTO`, ver seção 21): campos discutidos incluem `url`, `secret`, `customer_id`, lista de status filtrados e estado ativo (`[09:21] Bruno`), com suporte a secret antiga/nova durante rotação (`ADR-004`).
-- **`webhook_outbox`** (`ADR-006`): evento de mudança de status com payload já renderizado como snapshot no momento da inserção (`[09:51]-[09:52]`), campo de status do próprio evento (pendente/processando/falhou/entregue) e `created_at`, com índices sobre esses dois campos para leitura eficiente pelo worker em batches pequenos (`[09:07]-[09:08] Diego`). Chave primária em UUID, consistente com o restante do schema (`[09:50]-[09:51]`; `ADR-005`).
-- **`webhook_dead_letter`** (`ADR-007`): payload do evento, motivo da falha e timestamp, populada quando as 5 tentativas de retry se esgotam.
+- Uma tabela de outbox (`webhook_outbox`, nome mencionado nominalmente em `[09:06]` Diego), com evento persistido como snapshot já renderizado no momento da inserção — e não recalculado no momento do envio — para refletir fielmente o estado do pedido no instante da transição, mesmo que o pedido seja alterado posteriormente (`[09:51]-[09:52]` Larissa/Diego/Bruno). Diego menciona indexação por campo de status (pendente/processando/falhou/entregue) e por `created_at` para suportar a leitura eficiente pelo worker (`[09:07]-[09:08]`).
+- Uma tabela de configuração de webhook, armazenando ao menos URL, secret, `customer_id` e estado ativo (`[09:21]` Bruno/Sofia).
+- Uma tabela de Dead Letter Queue (`webhook_dead_letter`), separada da outbox principal, com payload do evento, motivo da falha e timestamp (`[09:18]` Diego — ADR-007).
 
-A filtragem de quais webhooks devem receber cada evento ocorre no momento da inserção na outbox, não no momento do envio (`[09:34] Bruno/Diego`) — se nenhum webhook do customer estiver interessado no status resultante, nenhuma linha é inserida. `ADR-003` já registra como `QUESTÃO EM ABERTO` a forma exata dessa consulta dentro da mesma `tx` e seu impacto na duração do lock da transação de `changeStatus` — esta RFC não resolve esse ponto, apenas o herda.
+O desenho físico completo desses modelos (nomes de campos, tipos, índices adicionais, relacionamentos formais em `schema.prisma`) é responsabilidade do FDD, não desta RFC.
 
-Arquivamento ou purga de eventos já entregues (mencionado como "depois de 30 dias ou assim") está fora do escopo desta fase (`[09:08] Diego`; seção 5).
+Arquivamento de eventos já entregues após 30 dias foi mencionado como necessidade futura, mas está explicitamente fora do escopo desta feature (`[09:08]` Diego). Política de retenção de registros em DLQ já reprocessados: **QUESTÃO EM ABERTO** (não discutida na reunião nem coberta pelas ADRs — ver ADR-007, seção de Consequências).
+
+---
 
 ## 13. APIs e Integrações
 
-Os seguintes endpoints foram discutidos na reunião como parte do contrato funcional do módulo `webhooks`, mas nenhum deles possui uma ADR dedicada — são tratados aqui como parte da proposta desta RFC, com o prefixo de rota `/api/v1/*` inferido por consistência com o padrão observado em `src/routes/index.ts:21-31` (Assumido, não citado literalmente na transcrição):
+Do lado interno (exposto pela plataforma), a proposta prevê minimamente os seguintes pontos de integração levantados na reunião — o detalhamento de contrato (schemas, códigos de status HTTP, matriz de erros) é responsabilidade do FDD:
 
-| Método | Rota (proposta) | Autenticação | Descrição |
-|---|---|---|---|
-| `POST` | `/webhooks` | JWT (qualquer role) | Cadastra webhook; `secret` gerada pela plataforma e devolvida na resposta (`[09:31]-[09:32]`) |
-| `PATCH` | `/webhooks/:id` | JWT (qualquer role) | Edita configuração do webhook (`[09:33]`) |
-| `DELETE` | `/webhooks/:id` | JWT (qualquer role) | Remove webhook (`[09:33]`) |
-| `GET` | `/webhooks` | JWT (qualquer role) | Lista webhooks de um customer (`[09:33]`) |
-| `GET` | `/webhooks/:id/deliveries` | JWT (qualquer role) | Histórico de entregas (sucesso/falha, payload, response, tempo de resposta) (`[09:34]-[09:35]`) |
-| `POST` | `/admin/webhooks/dead-letter/:id/replay` | JWT + role `ADMIN` | Reprocessa evento em DLQ, recolocando-o na outbox como pendente (`[09:18]`, `[09:35]-[09:36]`; `ADR-007`) |
+- CRUD de configuração de webhook: criação (URL + lista de status de interesse; secret gerada e devolvida na criação), edição, remoção e listagem por customer (`[09:31]-[09:33]` Marcos/Bruno).
+- Consulta de histórico de entregas por webhook (`GET /webhooks/:id/deliveries`) (`[09:34]` Marcos).
+- Rotação de secret via API, com grace period de 24h (`[09:21]` Sofia).
+- Endpoint administrativo de replay de evento em DLQ (`POST /admin/webhooks/dead-letter/:id/replay`), restrito a role `ADMIN` (`[09:18]`, `[09:35]-[09:36]` Diego/Sofia).
 
-A integração de saída (worker → cliente) segue o contrato definido em `ADR-004` e `ADR-005`: `POST` HTTPS para a `url` cadastrada, corpo JSON conforme seção 6.1, cabeçalhos `X-Event-Id`, `X-Signature`, `X-Timestamp`, `X-Webhook-Id` e `Content-Type: application/json` (`[09:44]-[09:45]`).
+Do lado externo (integração de saída, plataforma → cliente), cada chamada de entrega carrega os seguintes headers, conforme fechado em `[09:44]-[09:45]` Diego/Sofia:
 
-`QUESTÃO EM ABERTO`: nomes exatos de rota, formato de resposta e paginação de `GET /webhooks/:id/deliveries` (a transcrição menciona "últimos 100" apenas de forma coloquial, sem fechar como limite de paginação formal) não foram detalhados na reunião nem existem em código — devem ser especificados em um Design Doc/FDD subsequente.
+- `X-Event-Id`: UUID único do evento, constante entre tentativas de retry (ADR-005).
+- `X-Signature`: assinatura HMAC-SHA256 do corpo do request (ADR-004).
+- `X-Timestamp`: timestamp do envio, permitindo ao cliente detectar replay attacks se desejar.
+- `X-Webhook-Id`: identificador do cadastro de webhook, permitindo a um cliente com múltiplos endpoints saber qual cadastro recebeu o evento (`[09:44]` Sofia).
+- `Content-Type: application/json`.
+
+O payload JSON contém `event_id`, `event_type` (ex.: `"order.status_changed"`), timestamp ISO 8601, `order_id`, `order_number`, `from_status`, `to_status`, `customer_id` e campos básicos do pedido (ex.: `total_cents`) — deliberadamente sem os itens do pedido, para manter o payload enxuto; o cliente que precisar de detalhes deve consultar `GET /orders/:id` (`[09:43]-[09:44]` Diego/Bruno). Timeout de chamada HTTP do worker: 10 segundos (`[09:42]` Diego/Sofia).
+
+---
 
 ## 14. Segurança
 
-- **Autenticidade e integridade dos eventos:** HMAC-SHA256 sobre o corpo do request, com secret única por endpoint cadastrado — não secret global — para limitar o raio de impacto de um vazamento a um único cadastro, motivado por um incidente real já ocorrido com um cliente (`ADR-004`; `[09:19]-[09:22] Sofia/Diego`).
-- **Rotação de secret:** suportada via API, com grace period de 24h em que ambas as secrets (antiga e nova) são válidas simultaneamente (`ADR-004`).
-- **Transporte:** TLS obrigatório — cadastro de URL não-HTTPS deve ser recusado na validação de schema (`[09:23] Sofia`).
-- **Limite de payload:** eventos acima de 64KB não devem ser enviados; a plataforma deve tratar isso como erro, não como truncamento (`[09:23]-[09:24]`).
-- **Autorização interna:** endpoints CRUD de configuração exigem apenas autenticação JWT padrão, sem restrição de role (`[09:36]-[09:37]`); o endpoint de replay de DLQ exige role `ADMIN`, reaproveitando `requireRole` (`src/middlewares/auth.middleware.ts:49-61`), com exigência explícita de log de auditoria de quem executou o replay (`[09:35]-[09:36] Sofia`; `ADR-007`).
-- **Responsabilidade do cliente:** garantia de entrega at-least-once transfere a responsabilidade de deduplicação para o lado do cliente via `X-Event-Id` — um trade-off de segurança/confiabilidade explicitamente aceito e a ser documentado no portal de desenvolvedor (`ADR-005`; `[09:26] Marcos`).
-- **Lacunas de segurança identificadas em ADR mas não resolvidas nesta RFC:** forma de armazenamento da secret em repouso (texto plano, hash ou criptografada) — `NEEDS INPUT` em `ADR-004`; fluxo de revogação de emergência de uma secret comprometida durante a própria janela de rotação — `NEEDS INPUT` em `ADR-004`. Esta RFC não resolve essas lacunas; herda-as como questões em aberto (seção 21).
+- **Autenticidade e integridade:** todo evento é assinado com HMAC-SHA256 sobre o corpo do request, com secret exclusiva por endpoint cadastrado — nunca uma secret global da plataforma (`[09:19]-[09:21]` Sofia — ADR-004). Essa escolha é motivada por um incidente real de vazamento de secret em log de aplicação de um cliente (`[09:22]` Diego).
+- **Rotação de credenciais:** a secret é rotacionável via API; durante a rotação, a secret antiga permanece válida por 24 horas em paralelo à nova, evitando indisponibilidade do lado do cliente durante a migração (`[09:21]` Sofia). Não há, nas fontes disponíveis, um fluxo definido de revogação de emergência de uma secret comprometida antes do fim do grace period — ponto sinalizado como lacuna na própria ADR-004.
+- **Transporte:** URLs de webhook devem ser obrigatoriamente HTTPS; cadastro com `http://` é recusado por validação de schema (`[09:23]` Sofia).
+- **Limite de payload:** eventos com corpo superior a 64KB não são enviados; o sistema deve retornar erro explícito em vez de truncar silenciosamente (`[09:23]-[09:24]` Sofia/Diego).
+- **Controle de acesso:** o CRUD de configuração de webhook exige apenas JWT válido (qualquer role) nesta fase; o endpoint administrativo de replay de DLQ exige role `ADMIN`, reaproveitando o `requireRole` já existente (`[09:35]-[09:36]` Sofia/Larissa — ADR-007), com exigência de log de auditoria por replay executado (`[09:36]` Sofia).
+- **Armazenamento da secret em repouso:** **QUESTÃO EM ABERTO** — a ADR-004 registra explicitamente a ausência de definição sobre se a secret será armazenada em texto plano, com hash, ou criptografada com chave de aplicação/KMS; esse ponto impacta diretamente o risco residual de um vazamento de banco de dados e não foi decidido na reunião.
+- **Revisão dedicada:** a Sofia reservou pelo menos dois dias úteis de revisão de segurança específica sobre HMAC e geração de secret antes do deploy (`[09:46]` Sofia/Larissa).
+
+---
 
 ## 15. Escalabilidade e Performance
 
-O worker opera em modelo **single-worker** com polling a cada 2 segundos, o que atende com folga o requisito de latência de 10 segundos (`ADR-008`), mas implica que a garantia de ordering de entrega só existe por `order_id`, e apenas enquanto houver exatamente um worker em execução (`[09:12]-[09:13]`; `ADR-006`, `ADR-008`). Evoluir para múltiplos workers em paralelo exigiria resolver particionamento por `order_id` ou lock pessimista, problema declarado como futuro e fora do escopo atual (`[09:13] Diego`).
+- A latência-alvo de entrega (abaixo de 10 segundos) é atendida com folga pelo polling de 2 segundos do worker, mesmo no pior caso (`[09:09]-[09:10]` Diego/Marcos — ADR-008).
+- A leitura da outbox pelo worker deve ser feita em lotes pequenos ("batch pequeno"), com índice em campo de status e em `created_at`, segundo Diego (`[09:07]-[09:08]`); dimensionamento exato de tamanho de lote é **TBD**, sem número fechado na reunião.
+- O modelo assume explicitamente um único worker em execução (`single-worker`) como premissa de ordering: eventos do mesmo `order_id` são entregues na ordem correta apenas enquanto houver um único worker processando a outbox em ordem de `created_at` (`[09:12]` Diego). Não há garantia de ordering global entre pedidos distintos — os clientes nunca solicitaram essa garantia (`[09:14]` Marcos).
+- Evolução para múltiplos workers em paralelo exigiria resolver particionamento por `order_id` ou lock pessimista — tratado como problema futuro, deliberadamente fora do escopo desta proposta (`[09:13]` Diego/Bruno).
+- Volume de eventos esperado, número de clientes simultâneos ativos e throughput-alvo do worker sob carga real: **TBD** — nenhuma métrica ou projeção numérica está disponível nas fontes.
+- Rate limiting de envio para clientes que gerem picos de eventos (ex.: 50 pedidos mudando de status em um minuto) foi identificado como risco em potencial, mas deliberadamente não endereçado nesta fase — ver Seção 21.
 
-A tabela `webhook_outbox` deve ter índices sobre o campo de status do evento e sobre `created_at`, para que o worker leia apenas os eventos pendentes mais antigos em lotes pequenos (`[09:07]-[09:08] Diego`). Não há, nas fontes disponíveis, uma definição de tamanho de lote (`batch size`) de leitura — `TBD`.
-
-Rate limiting de saída para um mesmo cliente em rajadas de eventos foi levantado como preocupação real (ex.: 50 pedidos mudando de status no mesmo minuto), mas a equipe decidiu observar o comportamento em produção antes de decidir se implementa (`[09:38]-[09:39] Diego/Larissa`) — tratado nesta RFC como risco aceito conscientemente (seção 19), não como requisito desta fase.
+---
 
 ## 16. Observabilidade
 
-A proposta é reaproveitar integralmente a infraestrutura de observabilidade já existente, sem introduzir componente novo: o logger Pino (`src/shared/logger`) deve ser usado tanto pelo módulo `webhooks` quanto pelo processo `src/worker.ts`, e o middleware de erro centralizado (`src/middlewares/error.middleware.ts:14-65`) já trata qualquer `AppError` lançado pelos novos endpoints sem necessidade de alteração (`[09:29] Bruno`).
+- **Logs:** o módulo de webhooks deve reaproveitar o logger Pino já configurado no projeto (`src/shared/logger/index.ts`), sem introduzir novo mecanismo de logging (`[09:29]` Bruno).
+- **Tratamento de erros:** o middleware de erro centralizado (`src/middlewares/error.middleware.ts`) já trata `AppError`, `ZodError` e erros conhecidos do Prisma; os novos erros `WEBHOOK_*` devem seguir a mesma hierarquia `AppError` sem exigir mudanças no middleware (`[09:29]` Bruno).
+- **Auditoria:** toda execução do endpoint administrativo de replay de DLQ deve ser logada com o usuário responsável (`[09:36]` Sofia).
+- **Histórico de entregas exposto ao cliente:** cada tentativa de entrega (sucesso ou falha), incluindo payload, response e tempo de resposta, deve ficar disponível para consulta pelo cliente via `GET /webhooks/:id/deliveries` (`[09:34]` Marcos) — este histórico é também a principal fonte de observabilidade operacional mencionada nas fontes.
+- **Monitoramento de DLQ:** não há, nas fontes disponíveis, definição de processo ou responsável formal para revisão periódica dos itens acumulados em `webhook_dead_letter`, apesar de a equipe ter reconhecido essa necessidade como consequência de longo prazo (ADR-007) — ver Seção 21.
+- Métricas de negócio/operacionais (ex.: taxa de sucesso de entrega, latência p95, volume de eventos por hora) não foram discutidas na reunião: **TBD**.
 
-Do lado de auditoria funcional, o histórico de entregas exposto via `GET /webhooks/:id/deliveries` (seção 13) funciona como observabilidade de negócio voltada ao cliente, e o log de auditoria do endpoint de replay de DLQ (`[09:36] Sofia`) cobre a rastreabilidade de ações administrativas.
-
-Não há, em nenhuma das três fontes, decisão sobre métricas dedicadas (ex.: taxa de sucesso de entrega, tamanho da fila de outbox pendente, volume de DLQ) nem sobre alertas operacionais. `ADR-007` já registra como `NEEDS INPUT` a ausência de um processo formal de monitoramento periódico da DLQ — esta RFC não resolve essa lacuna, apenas a explicita como questão em aberto (seção 21).
+---
 
 ## 17. Alternativas Consideradas
 
-As três alternativas abaixo foram discutidas e explicitamente descartadas durante a reunião, já formalizadas como `REJEITADA` nas ADRs correspondentes. Esta RFC não as reabre — elas são reproduzidas aqui em nível de arquitetura de sistema porque moldam por que o desenho proposto na seção 9 e 10 tem o formato que tem.
-
 ### Alternativa 1 — Disparo síncrono de webhook dentro de `OrderService.changeStatus`
 
-Chamar o endpoint HTTP do cliente diretamente dentro da mesma transação de mudança de status, sem outbox nem worker.
+Chamar o endpoint HTTP do cliente B2B diretamente dentro da própria transação de mudança de status, sem outbox nem worker intermediário. Foi a primeira opção discutida na reunião, antes de qualquer menção a outbox (`[09:03]` Larissa: "a gente dispara isso sincronamente no service de orders quando o status muda, ou faz algum tipo de fila/outbox?").
 
 **Vantagens**
-- Implementação mais simples no curto prazo, sem tabela outbox nem processo adicional.
-- Entrega imediata, sem a latência mínima de um ciclo de polling.
+
+- Implementação mais simples no curto prazo, sem necessidade de tabela adicional nem processo worker.
+- Entrega imediata ao cliente, sem a latência mínima introduzida por um ciclo de polling.
 
 **Desvantagens**
-- Um cliente lento ou indisponível trava a mudança de status de outros pedidos (`[09:04] Bruno`).
-- Sem possibilidade de rollback coerente caso a chamada HTTP falhe no meio da transação (`[09:04] Bruno`).
-- Acopla a confiabilidade do domínio de pedidos à disponibilidade de sistemas de terceiros.
 
-Formalmente rejeitada em `ADR-003` e `ADR-006`.
+- Uma chamada HTTP lenta ou um cliente indisponível travaria a mudança de status de outros pedidos, já que a transação de `changeStatus` é descrita como "pesada" (atualiza `orders`, insere em `order_status_history`, decrementa `stock_quantity`) (`[09:04]` Bruno).
+- Não haveria como reverter (rollback) coerentemente a notificação caso o cliente estivesse fora do ar no meio da chamada (`[09:04]` Bruno).
+- Descartada por consenso imediato de Larissa e Bruno antes mesmo da chegada de Diego à call (`[09:04]-[09:05]`).
 
 ### Alternativa 2 — Fila externa dedicada (Redis Streams ou equivalente)
 
-Publicar o evento em uma fila de mensageria externa ao MySQL, consumida por um worker independente.
+Publicar o evento em uma fila de mensageria dedicada fora do MySQL, consumida por um worker independente, em vez de usar uma tabela de outbox no banco relacional já existente.
 
 **Vantagens**
-- Desacoplaria completamente a entrega de eventos da transação de banco, com maior throughput potencial.
-- Suportaria múltiplos consumidores e escalonamento horizontal nativo.
+
+- Desacoplaria completamente a infraestrutura de mensageria do banco transacional principal, com maior throughput potencial.
+- Suporte nativo a múltiplos consumidores e escalonamento horizontal.
 
 **Desvantagens**
-- Reintroduz o problema clássico de dupla escrita (dual-write) entre MySQL e a fila, que o outbox no mesmo banco evita (`[09:07] Diego`).
-- Exige subir e operar infraestrutura nova, considerada overengineering para o tamanho da equipe (`[09:07] Diego`).
-- Nenhuma garantia atômica nativa entre o commit da transação de pedidos e a publicação na fila.
 
-Formalmente rejeitada em `ADR-006`.
+- Reintroduziria o problema clássico de dupla escrita (dual-write) entre MySQL e a fila externa, sem garantia atômica nativa entre o commit da transação de pedidos e a publicação na fila — exatamente o problema que o outbox no mesmo banco evita (`[09:07]` Diego).
+- Exigiria subir e operar infraestrutura adicional (ex.: Redis Cluster), considerado overengineering para o tamanho da equipe (`[09:07]` Diego: "a gente é um time pequeno. Subir Redis Cluster pra isso é overengineering.").
+- Descartada em favor do outbox em MySQL, decisão fechada explicitamente por Larissa em `[09:08]` ("Tá decidido então: outbox em MySQL").
 
-### Alternativa 3 — Mecanismo reativo via trigger de banco de dados
+### Alternativa considerada adicional — Trigger de banco para acionar o worker reativamente
 
-Usar um trigger de banco disparado na atualização de `Order` para acionar o worker de forma reativa, em vez de polling.
+Ainda que de menor peso na discussão, também foi levantada e descartada a ideia de usar um trigger de banco de dados para notificar o worker de forma reativa em vez de por polling (`[09:09]` Bruno: "Não dá pra usar trigger do banco pra ser mais reativo?"). Foi descartada porque o MySQL não possui mecanismo equivalente ao `LISTEN/NOTIFY` do PostgreSQL, e um trigger só executa SQL — não consegue acionar um processo externo — o que exigiria soluções paliativas (escrever em arquivo, chamar um endpoint) consideradas frágeis pela equipe (`[09:09]` Diego). O polling de 2 segundos foi considerado suficiente frente ao requisito de latência abaixo de 10 segundos.
 
-**Vantagens**
-- Potencial de latência de entrega mais próxima de zero.
-- Evita execução periódica de queries em tabelas eventualmente vazias.
-
-**Desvantagens**
-- MySQL não possui mecanismo nativo equivalente ao `LISTEN/NOTIFY` do PostgreSQL (`[09:09] Diego`).
-- Um trigger só executa SQL, não consegue notificar um processo externo; soluções paliativas (escrever em arquivo, chamar endpoint) foram consideradas frágeis e fora do padrão pela equipe (`[09:09] Diego`).
-- Complexidade adicional não se justifica frente a um requisito de latência (<10s) já atendido com folga pelo polling de 2s.
-
-Formalmente rejeitada em `ADR-006` e `ADR-008`.
-
-A análise de alternativas em nível de sistema (por exemplo, arquiteturas orientadas a eventos com broker dedicado, ou serviços gerenciados de terceiros para entrega de webhooks) não foi realizada pela equipe nesta reunião — não há evidência nas fontes de que essas opções tenham sido sequer cogitadas, e esta RFC não as inventa.
+---
 
 ## 18. Trade-offs
 
-- **Simplicidade operacional vs. latência mínima garantida:** reaproveitar o MySQL via outbox evita subir infraestrutura nova, mas introduz uma latência mínima inerente de até 2 segundos por causa do polling, em vez de entrega verdadeiramente orientada a eventos (`ADR-006`, `ADR-008`).
-- **Simplicidade de contrato vs. responsabilidade transferida ao cliente:** garantir apenas at-least-once evita coordenação distribuída complexa do lado da plataforma, mas exige que cada cliente B2B implemente e mantenha sua própria lógica de deduplicação via `X-Event-Id` (`ADR-005`; objeção explícita de `[09:25] Sofia`).
-- **Isolamento de segurança vs. complexidade de gestão de credenciais:** secret por endpoint (em vez de secret global) reduz o raio de impacto de um vazamento, mas introduz a necessidade de gerir ciclo de vida (geração, rotação, expiração) de uma credencial por cadastro — problema que o projeto nunca precisou resolver antes, já que a autenticação interna via JWT é stateless (`ADR-004`; contraste com `ADR-001`).
-- **Consistência forte pontual vs. acoplamento entre módulos:** garantir atomicidade entre mudança de status e registro do evento exige que `OrderService` chame uma função do módulo WEBHOOKS dentro de sua própria transação, criando um ponto de acoplamento entre domínios que precisa ser mantido estável à medida que o módulo WEBHOOKS evolui (`ADR-003`).
-- **Resiliência de curto prazo vs. capacidade operacional futura:** o modelo single-worker com ordering apenas por `order_id` é suficiente e simples para o volume e o requisito atuais, mas qualquer evolução futura para múltiplos workers exigirá redesenho de coordenação (particionamento ou lock pessimista) (`ADR-006`, `ADR-008`).
-- **Janela de tolerância a falhas vs. tempo de detecção de problemas recorrentes:** a janela de retry de ~15 horas (`ADR-007`) cobre bem indisponibilidades pontuais de cliente, mas, combinada com a ausência de notificação automática de falha (email adiado, `[09:37]-[09:38]`), significa que problemas recorrentes de entrega só são percebidos pelo próprio cliente reportando, ou por checagem manual da DLQ.
+- **Consistência forte vs. latência mínima:** a escolha do padrão outbox com polling garante que nenhum evento seja perdido ou "fantasma", mas introduz uma latência mínima inerente de até 2 segundos (o intervalo de polling), em vez da entrega instantânea que um disparo síncrono ofereceria — trade-off aceito porque ainda folga com relação ao requisito de negócio de 10 segundos (ADR-006, ADR-008).
+- **Simplicidade operacional vs. throughput/escalabilidade futura:** operar um único worker é operacionalmente mais simples e preserva ordering por `order_id`, mas limita a capacidade de escalar horizontalmente o consumo de eventos; evoluir para múltiplos workers exigirá resolver particionamento ou lock pessimista, problema deliberadamente adiado (`[09:12]-[09:13]` Diego/Bruno).
+- **Reuso de infraestrutura existente (MySQL) vs. componente de mensageria dedicado:** reaproveitar o MySQL evita subir e operar infraestrutura nova para um time pequeno, mas aceita o teto de desempenho e a ausência de notificação reativa nativa que uma fila dedicada ofereceria (`[09:07]` Diego).
+- **Responsabilidade de deduplicação transferida ao cliente vs. simplicidade de entrega:** garantir apenas at-least-once mantém o backend simples (sem coordenação distribuída), mas desloca uma responsabilidade de engenharia real (deduplicação por `X-Event-Id`) para cada cliente B2B integrador — objeção explícita levantada por Sofia (`[09:25]`) e aceita conscientemente pela equipe (ADR-005).
+- **Janela de resiliência ampla vs. eventos "em voo" por mais tempo:** a política de 5 tentativas com backoff até 12h cobre indisponibilidades de cliente de até ~15 horas (cobrindo um caso real já vivido pela equipe), mas mantém eventos não confirmados "em voo" por um período consideravelmente mais longo do que uma política mais agressiva de 3 tentativas ofereceria (`[09:15]-[09:17]` Diego/Bruno/Larissa — ADR-007).
+- **Isolamento de credenciais vs. complexidade de gestão de ciclo de vida:** secret única por endpoint (em vez de secret global) reduz o raio de impacto de um vazamento a um único cadastro, mas exige gestão de ciclo de vida de múltiplas secrets (geração, armazenamento, rotação, expiração) — responsabilidade nova que o projeto nunca precisou assumir antes, já que a autenticação JWT interna é stateless (ADR-001 vs. ADR-004).
+- **Acoplamento transacional entre domínios vs. garantia de consistência:** inserir o evento de webhook dentro da mesma transação de `OrderService.changeStatus` garante atomicidade, mas estabelece um precedente de acoplamento: qualquer efeito colateral futuro de `changeStatus` (não só webhooks) terá que decidir explicitamente se entra ou não nessa fronteira transacional, e a transação — já descrita como "pesada" — passa a incluir mais uma escrita (ADR-003).
 
-## 19. Riscos
+---
 
-- **Worker sem mecanismo de supervisão/restart definido.** Se o único processo worker falhar ou travar, toda a entrega de webhooks para todos os clientes para até que alguém reinicie o processo manualmente. `ADR-008` já registra isso como `NEEDS INPUT`: não há decisão sobre gerenciador de processos, orquestrador ou health check. *Mitigação possível (não decidida pelas fontes):* definir um mecanismo de supervisão de processo antes do rollout em produção — `QUESTÃO EM ABERTO`.
-- **Acúmulo de itens na DLQ sem processo de revisão definido.** `ADR-007` registra como `NEEDS INPUT` a ausência de um responsável ou rotina formal de monitoramento periódico de `webhook_dead_letter`. Sem isso, falhas definitivas podem se acumular sem que ninguém perceba. *Mitigação possível:* definir um processo operacional de revisão periódica da DLQ como pré-requisito de rollout — `QUESTÃO EM ABERTO`.
-- **Ausência de rate limiting de saída.** Um cliente com muitos pedidos mudando de status em curto intervalo pode receber um volume alto de chamadas HTTP quase simultâneas; a equipe decidiu observar antes de agir (`[09:38]-[09:39]`). *Mitigação:* nenhuma implementada nesta fase; risco aceito conscientemente e a ser reavaliado com base em dados reais de produção.
-- **Vazamento de secret de webhook.** Já ocorreu um incidente real com um cliente vazando secret em log de aplicação (`[09:22] Diego`). *Mitigação já decidida:* secret por endpoint (isola o raio de impacto) e suporte a rotação com grace period (`ADR-004`). Risco residual: ausência de fluxo de revogação de emergência durante a própria janela de rotação (`ADR-004`, `NEEDS INPUT`).
-- **Acoplamento entre o domínio ORDERS e o módulo WEBHOOKS.** Ainda que mitigado pelo desenho de função pura recebendo `tx` em vez de repositório completo (`ADR-003`), qualquer mudança futura em `changeStatus` precisa preservar a chamada a `publishWebhookEvent` dentro da mesma transação, sob risco de romper silenciosamente a garantia de consistência (`ADR-003`, `ADR-006`). *Mitigação:* cobertura de testes de integração que validem a atomicidade entre mudança de status e inserção na outbox.
-- **Aumento da duração/contenção de locks na transação de `changeStatus`.** A transação já era descrita como "pesada" antes desta feature (`[09:04] Bruno`); a inserção de mais uma escrita (outbox) mais uma possível consulta de configuração de webhooks dentro da mesma `tx` (ainda não detalhada, `ADR-003` `NEEDS INPUT`) tende a aumentar a janela de contenção de locks no banco. *Mitigação possível:* medir o impacto real em ambiente de teste antes do rollout — `QUESTÃO EM ABERTO`.
-- **Crescimento não controlado da tabela `webhook_outbox`.** Eventos entregues devem ser arquivados após um período (mencionado como "30 dias ou assim"), mas essa rotina está fora do escopo desta feature (`[09:08] Diego`). *Risco:* a tabela pode crescer indefinidamente até que uma feature de arquivamento seja implementada.
-- **Migração futura para exactly-once seria disruptiva.** Uma vez que clientes implementem dedup baseada em `X-Event-Id` sob o contrato at-least-once, uma futura mudança de garantia de entrega seria potencialmente disruptiva para integrações já em produção (`ADR-005`, `NEEDS INPUT` sobre SLA de comunicação a clientes já integrados).
+## 19. Impacto e Riscos
+
+**Impacto**
+
+- **Equipe de Pedidos (Bruno):** `OrderService.changeStatus` passa a ter uma dependência funcional nova (`publishWebhookEvent`), ainda que desacoplada via função pura recebendo `tx`; qualquer mudança futura nesse método precisa preservar a inserção do evento dentro da mesma transação.
+- **Equipe de Plataforma (Diego):** passa a operar, pela primeira vez no projeto, um segundo processo de longa duração (`src/worker.ts`), com necessidade de supervisão/restart em caso de falha — mecanismo ainda não definido (ver ADR-008, `[PRECISA DE INFORMAÇÃO]`).
+- **Segurança (Sofia):** ganha uma responsabilidade contínua nova de revisão de mecanismos de autenticação externa (HMAC, geração e rotação de secret), com pelo menos dois dias reservados antes do primeiro deploy (`[09:46]`).
+- **Produto (Marcos)/Clientes B2B:** os três clientes que solicitaram a feature (Atlas Comercial, MaxDistribuição, Nova Cargo) passam a depender operacionalmente da confiabilidade desse mecanismo de notificação; a documentação do contrato de entrega (at-least-once, dedup client-side) precisa ser publicada de forma destacada no portal de desenvolvedor (`[09:26]` Marcos).
+- **Processos existentes:** nenhuma rota ou fluxo hoje existente (`orders`, `customers`, `products`, `users`, `auth`) é removido ou alterado em seu comportamento externo; a mudança é aditiva sobre `OrderService.changeStatus`.
+
+**Riscos e mitigações**
+
+| Risco | Mitigação proposta / registrada |
+|---|---|
+| Segundo processo de longa duração (worker) sem mecanismo de supervisão/restart definido em caso de crash. | **Sem mitigação definida nas fontes** — ADR-008 registra explicitamente essa lacuna como `[PRECISA DE INFORMAÇÃO]`; deve ser resolvido antes da entrega. |
+| Aumento da duração/contenção de locks na transação já "pesada" de `changeStatus` pela escrita adicional na outbox. | Aceito conscientemente pela equipe como custo necessário para garantir atomicidade (ADR-003); não há medição de impacto real disponível — **TBD**. |
+| Vazamento de secret de webhook comprometendo autenticidade de eventos para um cliente. | Isolamento por secret única por endpoint (blast radius limitado a um cadastro) e suporte a rotação com grace period de 24h (ADR-004). Revogação de emergência antes do fim do grace period permanece sem fluxo definido — questão em aberto. |
+| Cliente processa o mesmo evento mais de uma vez (at-least-once). | Deduplicação client-side via `X-Event-Id`, documentada de forma destacada no portal de desenvolvedor (ADR-005, `[09:26]` Marcos). |
+| Eventos "pendurados" indefinidamente para um cliente permanentemente offline. | Teto de 5 tentativas com backoff exponencial, movendo o evento para DLQ ao esgotar (ADR-007). |
+| Falha definitiva de entrega passa despercebida sem monitoramento formal de DLQ. | **Sem mitigação definida** — ADR-007 registra a ausência de processo/responsável formal de revisão periódica da DLQ como lacuna explícita. |
+| Pico de eventos para um único cliente (ex.: 50 mudanças de status em um minuto) sobrecarregando o endpoint do cliente. | **Sem mitigação definida nesta fase** — tratado deliberadamente como "observar e decidir depois" (`[09:38]-[09:39]` Diego/Larissa). |
+| Perda de garantia de ordering ao evoluir para múltiplos workers no futuro. | Aceito como limitação conhecida do design atual (single-worker); solução (particionamento por `order_id` ou lock pessimista) fica para decisão futura (ADR-006, ADR-008). |
+| Migração futura de at-least-once para exactly-once ser disruptiva para integrações já em produção que implementaram dedup baseada em `X-Event-Id`. | Nenhuma mitigação de longo prazo definida além da documentação do contrato atual; ADR-005 registra isso como questão em aberto sobre SLA de comunicação a clientes já integrados. |
+
+---
 
 ## 20. Estratégia de Migração / Rollout
 
-Trata-se de uma feature inteiramente nova, sem dados legados a migrar: as tabelas de configuração de webhook, `webhook_outbox` e `webhook_dead_letter` não existem hoje em `prisma/schema.prisma` e serão criadas via migration nova (`prisma migrate dev`, conforme convenção já usada no projeto).
+A estimativa comunicada pela Tech Lead é de três sprints, decompostas informalmente da seguinte forma (`[09:45]-[09:46]` Larissa):
 
-A sequência de implementação estimada pela equipe, em três sprints, foi (`[09:45]-[09:46] Larissa`):
+1. Modelagem da tabela de outbox e da DLQ — aproximadamente uma sprint.
+2. Implementação do worker e da política de retry — aproximadamente uma sprint.
+3. CRUD de configuração de webhook e endpoint de histórico de entregas — aproximadamente meia sprint.
+4. Integração no `OrderService.changeStatus` e testes ponta a ponta — aproximadamente meia sprint.
+5. Implementação de HMAC, schemas de validação Zod e demais validações de segurança — tempo adicional não quantificado.
 
-1. Modelagem de outbox e DLQ — 1 sprint.
-2. Worker e retry — 1 sprint.
-3. CRUD de configuração e histórico de entregas — meio sprint.
-4. Integração em `OrderService.changeStatus` e testes ponta a ponta — meio sprint.
-5. HMAC, schemas e validações — tempo adicional não quantificado separadamente.
+A revisão de segurança dedicada da Sofia (mínimo dois dias úteis, focada em HMAC e geração de secret) está incluída no fim dessa janela, antes do deploy (`[09:46]` Larissa/Sofia). Como próximo passo imediato, a Tech Lead declarou a intenção de abrir um documento de design da feature e agendar uma sessão de revisão com Bruno e Diego antes do início da implementação (`[09:50]` Larissa).
 
-Antes do deploy em produção, a equipe reservou pelo menos dois dias úteis de revisão de segurança dedicada, especificamente sobre a implementação de HMAC e geração de secret (`[09:46]-[09:47] Sofia/Larissa`). Larissa também indicou a intenção de abrir um documento de design da feature e marcar uma sessão de revisão com Bruno e Diego antes do início da implementação (`[09:50] Larissa`) — nenhum detalhe adicional sobre feature flags, rollout gradual por cliente, ou plano de rollback foi discutido nas fontes disponíveis (`QUESTÃO EM ABERTO`).
+Não há, nas fontes disponíveis, uma estratégia formal de rollout gradual (ex.: feature flag, liberação por cliente, ambiente de staging dedicado para os três clientes B2B) nem um plano de rollback caso a feature apresente problemas em produção: **QUESTÃO EM ABERTO**.
+
+---
 
 ## 21. Questões em Aberto
 
-- Nome exato do model/tabela de configuração de webhook (endpoint, secret, customer_id, filtro de status, estado ativo) — discutido em termos de campos, mas nunca nomeado formalmente na reunião. `TBD`.
-- Nome exato do arquivo de processamento do worker dentro do módulo (`webhook.worker.ts` ou `webhook.processor.ts`) — as duas opções foram citadas sem decisão fechada (`[09:28] Bruno`). `TBD`.
-- Rate limiting de envio de webhooks para clientes com alto volume de eventos simultâneos — declarado como "observar e decidir depois" (`[09:38]-[09:39]`). `QUESTÃO EM ABERTO`.
-- Notificação automática ao cliente (ex.: e-mail) quando webhooks falham recorrentemente — adiado explicitamente para fase futura (`[09:37]-[09:38]`). `QUESTÃO EM ABERTO`.
-- Mecanismo de supervisão/restart do processo worker em caso de crash — não definido (`ADR-008`, `NEEDS INPUT`). `QUESTÃO EM ABERTO`.
-- Processo e responsável formal por monitorar e revisar periodicamente os itens acumulados em `webhook_dead_letter` — não definido (`ADR-007`, `NEEDS INPUT`). `QUESTÃO EM ABERTO`.
-- Tempo de retenção de registros de DLQ já reprocessados (ou nunca reprocessados) antes de purga/arquivamento — não definido (`ADR-007`, `NEEDS INPUT`). `QUESTÃO EM ABERTO`.
-- Forma de armazenamento da secret em repouso (texto plano, hash ou criptografada com KMS/chave de aplicação) — não definido (`ADR-004`, `NEEDS INPUT`). `QUESTÃO EM ABERTO`.
-- Fluxo de revogação de emergência de uma secret comprometida durante a própria janela de grace period de rotação — não definido (`ADR-004`, `NEEDS INPUT`). `QUESTÃO EM ABERTO`.
-- Como `publishWebhookEvent` consulta, dentro da mesma `tx`, quais webhooks do customer estão interessados em cada status, e qual o impacto disso na duração do lock da transação de `changeStatus` — não detalhado (`ADR-003`, `NEEDS INPUT`). `QUESTÃO EM ABERTO`.
-- Se o padrão de "efeito colateral publicado dentro da mesma transação via `tx`" deve virar uma convenção geral do projeto para futuros eventos de domínio além de webhooks, ou permanecer uma decisão específica deste caso — não definido (`ADR-003`, `NEEDS INPUT`). `QUESTÃO EM ABERTO`.
-- Tamanho do lote (`batch size`) de leitura de eventos pendentes pelo worker a cada ciclo de polling — não quantificado nas fontes. `TBD`.
-- Base de rota exata (`/api/v1/webhooks` vs. outro prefixo) e formato/paginação de `GET /webhooks/:id/deliveries` — inferido por convenção de projeto, não fechado em reunião nem em código. `QUESTÃO EM ABERTO`.
-- Necessidade futura de SLA ou comunicação formal a clientes já integrados caso a garantia de entrega evolua de at-least-once para exactly-once — não definido (`ADR-005`, `NEEDS INPUT`). `QUESTÃO EM ABERTO`.
-- Modelo de permissão mais granular (por `customer_id`) para os endpoints CRUD de configuração de webhook, hoje abertos a qualquer role autenticada — sinalizado como possível evolução futura, sem desenho (`[09:36]-[09:37]`). `QUESTÃO EM ABERTO`.
-- Plano de rollout gradual, feature flag ou estratégia de rollback em caso de problema em produção — não discutido em nenhuma das fontes. `TBD`.
+- **Rate limiting de envio para clientes com picos de eventos:** levantado por Diego como preocupação real (cenário de 50 pedidos mudando de status em um minuto), mas explicitamente não incorporado ao escopo desta fase — a decisão registrada foi "observar e decidir depois" (`[09:38]-[09:39]` Diego/Larissa).
+- **Notificação automática ao cliente em caso de falhas recorrentes de entrega (ex.: e-mail após 3 falhas seguidas):** perguntado por Marcos e explicitamente adiado para uma fase futura, condicionado à medição de impacto da versão atual (`[09:37]-[09:38]` Marcos/Larissa).
+- **Armazenamento da secret em repouso** (texto plano, hash, ou criptografia com KMS/chave de aplicação): não decidido na reunião; registrado como lacuna explícita na ADR-004.
+- **Fluxo de revogação de emergência de uma secret comprometida** durante a janela de grace period de 24h: não discutido na reunião nem coberto pelo código; lacuna explícita na ADR-004.
+- **Processo/responsável formal de monitoramento periódico da DLQ:** reconhecido pela equipe como necessidade de longo prazo, mas sem definição de dono ou cadência; lacuna explícita na ADR-007.
+- **Política de retenção de registros em DLQ** (já reprocessados ou nunca reprocessados) antes de purga/arquivamento: não discutida na reunião nem coberta pelo código; lacuna explícita na ADR-007.
+- **Mecanismo de supervisão/restart do processo worker em caso de crash** (gerenciador de processos, orquestrador, health check): a equipe reconheceu a necessidade de tratar "erros não capturados" no ciclo de vida do worker, mas não fechou como isso será operacionalizado; lacuna explícita na ADR-008.
+- **Endurecimento futuro de RBAC no CRUD de configuração de webhook:** Marcos perguntou se o restante do CRUD poderia permanecer com qualquer role autenticada; Sofia respondeu "por enquanto sim. Mais pra frente a gente pode endurecer" — decisão futura não fechada (`[09:36]-[09:37]`).
+- **Estratégia formal de rollout gradual e plano de rollback em produção:** não mencionados em nenhum momento da reunião nem cobertos pelas ADRs — QUESTÃO EM ABERTO identificada nesta RFC (Seção 20).
+- **Volume de tráfego esperado, número de clientes simultâneos e throughput-alvo do worker sob carga real:** nenhuma métrica ou projeção numérica está disponível nas fontes — TBD.
+
+---
 
 ## 22. Status da Proposta
 
 **Status:** PENDING REVIEW
 
-Esta RFC apresenta uma proposta arquitetural que ainda está sujeita a revisão e discussão técnica, em particular no que diz respeito aos aspectos do desenho de sistema ainda não cobertos por nenhuma das oito ADRs já formalizadas (modelo de dados de configuração de webhook, contrato de API completo, observabilidade, plano de rollout). As seis decisões técnicas centrais (`ADR-003` a `ADR-008`) e as duas decisões de infraestrutura de base (`ADR-001`, `ADR-002`) já estão fechadas e não são reabertas por esta RFC.
+Esta RFC consolida decisões arquiteturais que já foram debatidas e fechadas por consenso na reunião de refinamento técnico de 2026-08-31 e formalizadas nas ADR-003 a ADR-008 (além da fundação já estabelecida nas ADR-001 e ADR-002). Nesse sentido, os elementos centrais da arquitetura (outbox em MySQL, HMAC-SHA256, at-least-once, retry/DLQ, worker separado) não estão em aberto para reconsideração nesta RFC — eles são tratados como decisões confirmadas e citadas por identificador.
 
-Após a revisão, os pontos ainda em aberto listados na seção 21 poderão ser resolvidos, o desenho geral poderá ser ajustado, ou partes dele poderão ser rejeitadas. Qualquer nova decisão arquitetural que resulte dessa revisão — por exemplo, o nome final da tabela de configuração de webhook, o mecanismo de supervisão do worker, ou a política de rate limiting — deverá ser registrada posteriormente em uma ADR apropriada, seguindo o mesmo padrão MADR já usado em `docs/adrs/`.
+O que permanece sujeito a revisão e discussão técnica adicional é a articulação geral da proposta como um todo, a viabilidade do prazo de três sprints frente ao escopo consolidado, e — principalmente — as questões em aberto listadas na Seção 21, que a própria equipe reconheceu não ter fechado.
+
+Após a revisão, esta proposta poderá ser aprovada, modificada ou rejeitada em suas partes ainda não cobertas por ADR. Qualquer nova decisão arquitetural que resulte dessa revisão (por exemplo, sobre rate limiting, monitoramento de DLQ, ou armazenamento de secret em repouso) deverá ser registrada posteriormente em uma ADR apropriada.
+
+---
 
 ## 23. Próximos Passos
 
-- Abrir e revisar um documento de design mais detalhado (Design Doc/FDD) da feature, com sessão dedicada de revisão entre Bruno, Diego e Larissa antes do início da implementação (`[09:50] Larissa`).
-- Reservar e agendar a revisão de segurança de Sofia (mínimo dois dias úteis), com foco em HMAC e geração de secret, antes do deploy (`[09:46]-[09:47]`).
-- Confirmar o prazo estimado (três sprints) com a Atlas Comercial (`[09:47] Marcos`).
-- Resolver as questões em aberto listadas na seção 21 que bloqueiam o início da implementação (em especial: nome do model de configuração de webhook, nome do arquivo de processamento do worker, mecanismo de supervisão do processo worker).
-- Registrar em ADR dedicada qualquer decisão nova que resulte da resolução dos pontos em aberto desta RFC.
-- Definir, junto ao time de produto, se e quando o modelo de permissão granular por `customer_id` para os endpoints CRUD de webhook precisa ser endereçado.
+- Abrir o documento de design (FDD) da feature, detalhando endpoints, schemas Zod, matriz de erros `WEBHOOK_*` e modelagem física completa das tabelas propostas (outbox, configuração de webhook, DLQ), conforme intenção declarada por Larissa (`[09:50]`).
+- Agendar sessão de revisão técnica do design com Bruno e Diego antes do início da implementação (`[09:50]` Larissa).
+- Reservar a janela de revisão de segurança dedicada da Sofia (mínimo dois dias úteis) sobre HMAC e geração de secret antes do deploy (`[09:46]`).
+- Resolver, antes ou durante a implementação, as questões em aberto identificadas na Seção 21 que bloqueiam decisões de design do FDD (em especial armazenamento de secret em repouso e mecanismo de supervisão do worker).
+- Marcos deve atualizar os três clientes B2B (Atlas Comercial, MaxDistribuição, Nova Cargo) sobre o prazo estimado (`[09:47]` Marcos).
+- Formalizar em ADR qualquer decisão nova que surgir da resolução das questões em aberto (ex.: política de rate limiting, se e quando for endereçada).
+
+---
 
 ## 24. Histórico de Revisões
 
 | Versão | Data | Autor | Alteração |
 |---|---|---|---|
-| 1.0 | 2026-09-08 | TBD | Criação inicial |
+| 1.0 | 2026-08-31 | TBD | Criação inicial, consolidando `TRANSCRICAO.md`, ADR-001 a ADR-008 e evidências de código (`src/modules/orders`, `prisma/schema.prisma`, `src/shared/errors`, `src/middlewares`). |
