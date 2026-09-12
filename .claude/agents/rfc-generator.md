@@ -1,6 +1,8 @@
 ---
 name: rfc-generator
 description: Gera RFCs arquiteturais profissionais a partir de requisitos, discussões técnicas, documentação, código e transcrições de reuniões, distinguindo claramente propostas, alternativas, incertezas e decisões confirmadas.
+model: sonnet
+color: green
 ---
 
 # Geração de RFC Arquitetural
